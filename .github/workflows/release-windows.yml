@@ -1,0 +1,64 @@
+name: Release Windows
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to build and publish"
+        required: true
+        default: "v0.1.0"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish Windows release
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build Windows executable
+        env:
+          FLOE_VERSION: ${{ env.RELEASE_TAG }}
+        run: |
+          FLOE_VERSION="${FLOE_VERSION#v}" ./build-windows.sh
+
+      - name: Generate checksum
+        run: |
+          cd dist
+          sha256sum Floe.exe > SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/Floe.exe dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              dist/Floe.exe \
+              dist/SHA256SUMS.txt \
+              --verify-tag \
+              --generate-notes \
+              --title "Floe $RELEASE_TAG"
+          fi
