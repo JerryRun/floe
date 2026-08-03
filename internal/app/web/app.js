@@ -672,9 +672,16 @@ const syntaxKeywords = {
 
 function refreshEditorHighlight() {
   const editor = $("#editorContent");
+  const highlight = $("#editorHighlight");
   const selected = $("#syntaxMode").value;
   const language = selected === "auto" ? (state.editor?.language || "plain") : selected;
-  $("#editorHighlight").innerHTML = highlightSource(editor.value, language) + "\n";
+  try {
+    highlight.innerHTML = highlightSource(editor.value, language) + "\n";
+    editor.classList.add("syntax-overlay");
+  } catch (error) {
+    highlight.textContent = "";
+    editor.classList.remove("syntax-overlay");
+  }
   syncEditorScroll();
 }
 

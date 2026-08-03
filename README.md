@@ -2,7 +2,7 @@
 
 Floe 是一个由本地 Go Core 驱动的浏览器文件工作台。当前体验版支持：
 
-- 类 Xftp 的会话树、双文件面板、多本地/远程标签和双向拖放传输。
+- 分组会话树、双文件面板、多本地/远程标签和双向拖放传输。
 - 会话先保存后连接；支持 SFTP 和 FTP，SFTP 首次连接显示并确认主机 SHA-256 指纹。
 - 会话右键可查看、修改或删除配置；修改已连接会话后会断开旧连接，下次打开时使用新配置连接。
 - 会话密码由本机随机 AES-GCM 密钥加密后保存在用户数据目录，不写入明文。
@@ -21,14 +21,14 @@ Floe 是一个由本地 Go Core 驱动的浏览器文件工作台。当前体验
 - 同一 `Floe.exe` 通过 `floe ctl` 提供会话管理、目录、文本读取、日志以及本地/跨服务器并发校验传输，不要求浏览器 UI 正在运行。
 - 原生 Windows 托盘菜单和单实例保护，Windows 版不显示 CMD 窗口。
 
-## 在 WSL 中运行
+## 从源码运行
 
 ```bash
 cd floe
 GOPATH="$PWD/.cache/gopath" GOCACHE="$PWD/.cache/go-build" go run ./cmd/floe
 ```
 
-如果 WSL 无法自动打开浏览器：
+如果当前环境无法自动打开浏览器：
 
 ```bash
 GOPATH="$PWD/.cache/gopath" GOCACHE="$PWD/.cache/go-build" \

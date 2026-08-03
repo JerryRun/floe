@@ -233,8 +233,9 @@ button.primary { border-color: #116a74; background: var(--accent); color: white;
 .editor-layers { position: absolute; inset: 0 0 0 48px; min-width: 0; overflow: hidden; }
 #editorLineNumbers { position: absolute; inset: 0 auto 0 0; width: 48px; margin: 0; padding: 12px 8px 12px 0; overflow: hidden; border-right: 1px solid var(--line-soft); color: #899298; background: #f4f6f7; text-align: right; user-select: none; font-family: var(--mono); font-size: 13px; line-height: 1.55; }
 #editorHighlight, #editorContent { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; border: 0; padding: 12px; overflow: auto; white-space: pre; tab-size: 4; font-family: var(--mono); font-size: 13px; line-height: 1.55; }
-#editorHighlight { pointer-events: none; color: #28333a; background: #fbfcfc; }
-#editorContent { resize: none; outline: 0; color: transparent; caret-color: #17252c; background: transparent; -webkit-text-fill-color: transparent; }
+#editorHighlight { z-index: 2; overflow: hidden; pointer-events: none; color: #28333a; background: transparent; }
+#editorContent { z-index: 1; resize: none; outline: 0; color: #28333a; caret-color: #17252c; background: transparent; }
+#editorContent.syntax-overlay { color: transparent; -webkit-text-fill-color: transparent; }
 #editorContent::selection { background: rgba(82, 164, 176, .28); }
 .tok-comment { color: #74847c; font-style: italic; }
 .tok-string { color: #a45138; }
