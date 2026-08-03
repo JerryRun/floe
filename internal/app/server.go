@@ -40,6 +40,7 @@ type Server struct {
 	dataDir         string
 	manager         *core.Manager
 	sessionStore    *sessionStore
+	bookmarks       *bookmarkStore
 	transfers       *core.TransferEngine
 	connectProvider func(core.ConnectRequest) (core.ProviderInfo, error)
 	activity        *activityLog
@@ -66,8 +67,13 @@ func New(dataDir string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	bookmarks, err := newBookmarkStore(dataDir)
+	if err != nil {
+		return nil, err
+	}
 	server := &Server{
 		dataDir: dataDir, manager: manager, sessionStore: sessionStore,
+		bookmarks:       bookmarks,
 		transfers:       core.NewTransferEngine(manager, filepath.Join(dataDir, "tasks.json")),
 		connectProvider: manager.Connect,
 		activity:        newActivityLog(dataDir),
@@ -249,10 +255,16 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"csrf": r.Header.Get("X-Floe-Session-CSRF"), "name": "Floe"})
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/providers":
 		writeJSON(w, http.StatusOK, s.providers())
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/bookmarks":
+		writeJSON(w, http.StatusOK, s.bookmarks.List())
+	case r.Method == http.MethodPut && r.URL.Path == "/api/v1/bookmarks":
+		s.saveBookmarks(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions":
 		s.saveSession(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/private-key":
 		s.uploadPrivateKey(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v1/sessions/") && strings.HasSuffix(r.URL.Path, "/copy"):
+		s.copySession(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/sessions/"):
 		s.sessionDetails(w, r)
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/v1/sessions/"):
@@ -306,6 +318,21 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "API_NOT_FOUND", "API endpoint not found", "")
 	}
+}
+
+func (s *Server) saveBookmarks(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Key     string         `json:"key"`
+		Entries []pathBookmark `json:"entries"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if err := s.bookmarks.Save(request.Key, request.Entries); err != nil {
+		writeError(w, http.StatusBadRequest, "BOOKMARK_SAVE_FAILED", "保存书签失败", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) addClientLog(w http.ResponseWriter, r *http.Request) {
@@ -404,6 +431,27 @@ func (s *Server) uploadPrivateKey(w http.ResponseWriter, r *http.Request) {
 func sessionIDFromPath(value string) (string, bool) {
 	id := strings.TrimPrefix(value, "/api/v1/sessions/")
 	return id, id != "" && !strings.Contains(id, "/")
+}
+
+func sessionCopyIDFromPath(value string) (string, bool) {
+	value = strings.TrimPrefix(value, "/api/v1/sessions/")
+	id := strings.TrimSuffix(value, "/copy")
+	return id, id != "" && id != value && !strings.Contains(id, "/")
+}
+
+func (s *Server) copySession(w http.ResponseWriter, r *http.Request) {
+	id, valid := sessionCopyIDFromPath(r.URL.Path)
+	if !valid {
+		writeError(w, http.StatusNotFound, "SESSION_NOT_FOUND", "会话不存在", "")
+		return
+	}
+	provider, err := s.sessionStore.Copy(id)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "SESSION_COPY_FAILED", "复制会话失败", err.Error())
+		return
+	}
+	s.activity.Add("info", "session", "已复制会话 "+provider.Name, provider.Location)
+	writeJSON(w, http.StatusCreated, provider)
 }
 
 func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request) {

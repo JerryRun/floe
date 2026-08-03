@@ -81,6 +81,46 @@ func TestSessionStoreKeepsExistingSecretWhenEditingWithoutPassword(t *testing.T)
 	}
 }
 
+func TestSessionStoreCopyPreservesCredentialsAndIncrementsName(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := newSessionStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := core.ConnectRequest{
+		ID: "session-copy", Name: "生产服务器", Protocol: "sftp", Host: "host.example.test",
+		Port: 4322, User: "root", Password: "copy-me", Fingerprint: "SHA256:test", Group: "生产",
+	}
+	if _, err := store.Save(original); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Copy(original.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Copy(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID == original.ID || first.Name != "生产服务器 (2)" || second.Name != "生产服务器 (3)" {
+		t.Fatalf("copied sessions = %#v / %#v", first, second)
+	}
+	copied, err := store.Request(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if copied.Password != original.Password || copied.Fingerprint != original.Fingerprint || copied.Group != original.Group {
+		t.Fatalf("copied request = %#v", copied)
+	}
+	reloaded, err := newSessionStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reloaded.Request(second.ID); err != nil {
+		t.Fatalf("copied session was not persisted: %v", err)
+	}
+}
+
 func TestSessionStoreDefaultsTerminalAutoPasswordOnAndPersistsOptOut(t *testing.T) {
 	dataDir := t.TempDir()
 	store, err := newSessionStore(dataDir)

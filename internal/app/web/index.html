@@ -13,9 +13,8 @@
     <aside class="session-sidebar">
       <div class="sidebar-brand">
         <div class="brand"><img src="/assets/floe-64.png?v=3" alt=""><span>Floe</span></div>
-        <button id="sidebarAdd" class="icon-button" title="添加会话" aria-label="添加会话"><span class="material-symbols-rounded" aria-hidden="true">add</span></button>
       </div>
-      <div class="session-search"><span class="material-symbols-rounded" aria-hidden="true">search</span><input id="sessionSearch" placeholder="搜索会话"></div>
+      <div class="session-search"><span class="material-symbols-rounded" aria-hidden="true">search</span><input id="sessionSearch" placeholder="搜索会话"><button id="sidebarAdd" title="添加会话" aria-label="添加会话"><span class="material-symbols-rounded" aria-hidden="true">add</span></button></div>
       <div class="session-tree" id="sessionTree"></div>
     </aside>
 
@@ -27,6 +26,7 @@
             <button class="square-button up-button" title="上一级" aria-label="上一级"><span class="material-symbols-rounded" aria-hidden="true">arrow_upward</span></button>
             <button class="square-button refresh-button" title="刷新" aria-label="刷新"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button>
             <div class="path-control"><input class="path-input" value="/" aria-label="左侧路径"><button class="local-tree-button" title="选择本地目录" aria-label="选择本地目录"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button></div>
+            <span class="bookmark-control"><button class="bookmark-toggle" title="添加当前路径书签" aria-label="添加当前路径书签"><span aria-hidden="true">☆</span></button><button class="bookmark-menu-button" title="打开书签" aria-label="打开书签列表" aria-haspopup="menu" aria-expanded="false"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button></span>
             <button class="transfer-file-button" title="传输选中项到右侧"><span class="material-symbols-rounded" aria-hidden="true">upload</span><span>上传</span></button>
             <button class="square-button view-button" title="切换视图" aria-label="切换视图"><span class="material-symbols-rounded" aria-hidden="true">view_list</span></button>
             <button class="square-button terminal-button" title="在 Windows Terminal 中打开 SSH" aria-label="打开 SSH" aria-haspopup="menu"><span class="material-symbols-rounded" aria-hidden="true">terminal</span><span class="material-symbols-rounded menu-arrow" aria-hidden="true">expand_more</span></button>
@@ -45,6 +45,7 @@
             <button class="square-button up-button" title="上一级" aria-label="上一级"><span class="material-symbols-rounded" aria-hidden="true">arrow_upward</span></button>
             <button class="square-button refresh-button" title="刷新" aria-label="刷新"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button>
             <div class="path-control"><input class="path-input" value="/" aria-label="右侧路径"><button class="local-tree-button" title="选择本地目录" aria-label="选择本地目录"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button></div>
+            <span class="bookmark-control"><button class="bookmark-toggle" title="添加当前路径书签" aria-label="添加当前路径书签"><span aria-hidden="true">☆</span></button><button class="bookmark-menu-button" title="打开书签" aria-label="打开书签列表" aria-haspopup="menu" aria-expanded="false"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button></span>
             <button class="transfer-file-button" title="传输选中项到左侧"><span class="material-symbols-rounded" aria-hidden="true">download</span><span>下载</span></button>
             <button class="square-button view-button" title="切换视图" aria-label="切换视图"><span class="material-symbols-rounded" aria-hidden="true">view_list</span></button>
             <button class="square-button terminal-button" title="在 Windows Terminal 中打开 SSH" aria-label="打开 SSH" aria-haspopup="menu"><span class="material-symbols-rounded" aria-hidden="true">terminal</span><span class="material-symbols-rounded menu-arrow" aria-hidden="true">expand_more</span></button>
@@ -82,7 +83,13 @@
         <label>协议<select name="protocol" id="connectionProtocol"><option value="sftp">SFTP</option><option value="ftp">FTP</option></select></label>
         <label>端口<input name="port" type="number" value="22" min="1" max="65535"></label>
         <label class="wide">名称<input name="name" placeholder="生产服务器"></label>
-        <label class="wide">分组<input name="group" value="我的会话"></label>
+        <label class="wide">分组
+          <span class="editable-select" id="sessionGroupControl">
+            <input name="group" value="我的会话" autocomplete="off" role="combobox" aria-autocomplete="none" aria-controls="sessionGroupMenu" aria-expanded="false">
+            <button type="button" title="选择已有分组" aria-label="选择已有分组" tabindex="-1"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button>
+            <span class="editable-select-menu" id="sessionGroupMenu" role="listbox"></span>
+          </span>
+        </label>
         <label class="wide">主机<input name="host" placeholder="192.168.1.20"></label>
         <label>用户名<input name="user" autocomplete="username"></label>
         <label id="authMethodField">登录方式<select name="auth_method" id="connectionAuthMethod"><option value="password">密码</option><option value="key">SSH 密钥</option></select></label>
@@ -165,6 +172,7 @@
   <div class="toast-stack" id="toastStack" aria-live="polite"></div>
   <div class="context-menu" id="contextMenu" role="menu"></div>
   <div class="local-tree-popup" id="localTreePopup"></div>
+  <div class="bookmark-menu" id="bookmarkMenu" role="menu"></div>
   <div class="terminal-menu" id="terminalMenu" role="menu">
     <button data-terminal-placement="new-tab" role="menuitem"><span class="material-symbols-rounded" aria-hidden="true">add</span><span>新标签页</span></button>
     <button data-terminal-placement="split-right" role="menuitem"><span class="material-symbols-rounded" aria-hidden="true">view_list</span><span>当前标签右侧窗格</span></button>

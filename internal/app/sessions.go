@@ -241,6 +241,55 @@ func (s *sessionStore) List() []core.ProviderInfo {
 	return result
 }
 
+func (s *sessionStore) Copy(id string) (core.ProviderInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	original, ok := s.items[id]
+	if !ok {
+		return core.ProviderInfo{}, errors.New("会话不存在")
+	}
+	duplicate := original
+	duplicate.Name = nextSessionCopyName(original.Name, s.items)
+	for {
+		duplicate.ID = "session-" + randomToken(10)
+		if _, exists := s.items[duplicate.ID]; !exists {
+			break
+		}
+	}
+	s.items[duplicate.ID] = duplicate
+	if err := s.persistLocked(); err != nil {
+		delete(s.items, duplicate.ID)
+		return core.ProviderInfo{}, err
+	}
+	return duplicate.providerInfo(false), nil
+}
+
+func nextSessionCopyName(name string, items map[string]savedSession) string {
+	base := strings.TrimSpace(name)
+	if base == "" {
+		base = "会话"
+	}
+	start := 2
+	if open := strings.LastIndex(base, " ("); open > 0 && strings.HasSuffix(base, ")") {
+		var sequence int
+		suffix := base[open:]
+		if _, err := fmt.Sscanf(suffix, " (%d)", &sequence); err == nil && sequence >= 2 && suffix == fmt.Sprintf(" (%d)", sequence) {
+			base = strings.TrimSpace(base[:open])
+			start = sequence + 1
+		}
+	}
+	names := make(map[string]bool, len(items))
+	for _, item := range items {
+		names[strings.ToLower(strings.TrimSpace(item.Name))] = true
+	}
+	for sequence := start; ; sequence++ {
+		candidate := fmt.Sprintf("%s (%d)", base, sequence)
+		if !names[strings.ToLower(candidate)] {
+			return candidate
+		}
+	}
+}
+
 func (s *sessionStore) Details(id string) (sessionDetails, error) {
 	s.mu.RLock()
 	item, ok := s.items[id]

@@ -3,13 +3,17 @@ const state = {
   providers: [],
   activePane: "left",
   sessionSelected: "",
+  sessionGroups: [],
+  sessionGroupIndex: 0,
   groupState: {},
+  bookmarks: {},
   taskStatus: new Map(),
   transferMetrics: new Map(),
   tasks: [],
   logs: [],
   taskFilter: "queue",
   localTreeSide: "",
+  bookmarkSide: "",
   terminalProvider: "",
   panels: {
     left: { tabs: [], active: "", entries: [], selected: null, view: "list", sort: { field: "name", direction: "asc" }, renderQueued: false },
@@ -23,6 +27,7 @@ const state = {
 const DND_FILE = "application/x-floe-file";
 const DND_SESSION = "application/x-floe-session";
 const DND_TAB = "application/x-floe-tab";
+const BOOKMARKS_STORAGE = "floe.bookmarks.v1";
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
@@ -110,7 +115,79 @@ async function loadProviders(refreshTree = true) {
     const order = { local: 0, sftp: 1, ftp: 2 };
     return (order[a.kind] ?? 3) - (order[b.kind] ?? 3) || a.name.localeCompare(b.name);
   });
+  refreshSessionGroups();
   if (refreshTree) renderSessionTree();
+}
+
+function refreshSessionGroups() {
+  state.sessionGroups = [...new Set(state.providers
+    .filter((provider) => provider.kind !== "local" && provider.group)
+    .map((provider) => provider.group.trim())
+    .filter(Boolean))].sort((a, b) => a.localeCompare(b, "zh-CN"));
+  if ($("#sessionGroupControl").classList.contains("open")) renderSessionGroupMenu();
+}
+
+function renderSessionGroupMenu() {
+  const menu = $("#sessionGroupMenu");
+  menu.replaceChildren(...state.sessionGroups.map((group, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("role", "option");
+    button.textContent = group;
+    button.classList.toggle("active", index === state.sessionGroupIndex);
+    button.setAttribute("aria-selected", String(index === state.sessionGroupIndex));
+    button.addEventListener("click", () => chooseSessionGroup(index));
+    return button;
+  }));
+}
+
+function showSessionGroupMenu() {
+  if (!state.sessionGroups.length) return;
+  const control = $("#sessionGroupControl");
+  const input = $("input[name=group]", control);
+  const match = state.sessionGroups.findIndex((group) => group === input.value.trim());
+  state.sessionGroupIndex = match >= 0 ? match : 0;
+  renderSessionGroupMenu();
+  control.classList.add("open");
+  input.setAttribute("aria-expanded", "true");
+}
+
+function hideSessionGroupMenu() {
+  $("#sessionGroupControl").classList.remove("open");
+  $("#sessionGroupControl input[name=group]").setAttribute("aria-expanded", "false");
+}
+
+function toggleSessionGroupMenu() {
+  if ($("#sessionGroupControl").classList.contains("open")) hideSessionGroupMenu();
+  else showSessionGroupMenu();
+}
+
+function chooseSessionGroup(index) {
+  const group = state.sessionGroups[index];
+  if (group === undefined) return;
+  const input = $("#sessionGroupControl input[name=group]");
+  input.value = group;
+  hideSessionGroupMenu();
+  input.focus();
+}
+
+function handleSessionGroupKey(event) {
+  const open = $("#sessionGroupControl").classList.contains("open");
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    if (!open) showSessionGroupMenu();
+    else {
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      state.sessionGroupIndex = (state.sessionGroupIndex + step + state.sessionGroups.length) % state.sessionGroups.length;
+      renderSessionGroupMenu();
+    }
+  } else if (event.key === "Enter" && open) {
+    event.preventDefault();
+    chooseSessionGroup(state.sessionGroupIndex);
+  } else if (event.key === "Escape" && open) {
+    event.preventDefault();
+    hideSessionGroupMenu();
+  }
 }
 
 function renderSessionTree() {
@@ -168,12 +245,25 @@ function sessionIcon(provider) {
 }
 
 function showSessionMenu(event, provider) {
-  showContextMenu(event.clientX, event.clientY, [
+  const items = [
     { label: provider.connected ? "在右侧打开" : "连接并打开", action: () => openSession("right", provider.id) },
     { label: "查看 / 修改配置", action: () => editSession(provider.id) },
+    { label: "复制会话", action: () => copySession(provider) },
+  ];
+  if (provider.kind === "sftp") {
+    items.push(
+      { separator: true },
+      { heading: "用 Terminal 打开" },
+      { label: "新标签中打开", action: () => openSessionTerminal(provider.id, "new-tab") },
+      { label: "当前标签右侧窗格", action: () => openSessionTerminal(provider.id, "split-right") },
+      { label: "当前标签下方窗格", action: () => openSessionTerminal(provider.id, "split-down") },
+    );
+  }
+  items.push(
     { separator: true },
     { label: "删除会话", danger: true, action: () => deleteSession(provider) },
-  ]);
+  );
+  showContextMenu(event.clientX, event.clientY, items);
 }
 
 async function openSession(side, providerID, path = "") {
@@ -301,6 +391,7 @@ async function loadPanel(side, allowReconnect = true) {
     panel.entries = [];
     panel.selected = null;
     el.path.value = tab.path;
+    updateBookmarkControl(side);
     el.canvas.innerHTML = '<div class="empty-files">双击左侧会话以连接</div>';
     el.count.textContent = "未连接";
     el.selection.textContent = "";
@@ -308,6 +399,7 @@ async function loadPanel(side, allowReconnect = true) {
     return;
   }
   el.path.value = tab.path;
+  updateBookmarkControl(side);
   el.canvas.innerHTML = '<div class="empty-files">正在读取…</div>';
   try {
     const result = await api(`/api/v1/files?provider=${encodeURIComponent(tab.provider)}&path=${encodeURIComponent(tab.path)}`);
@@ -316,6 +408,7 @@ async function loadPanel(side, allowReconnect = true) {
     panel.entries = sortEntries(result.entries || [], panel.sort);
     panel.selected = null;
     el.path.value = tab.displayPath;
+    updateBookmarkControl(side);
     const provider = providerByID(tab.provider);
     el.root.classList.toggle("local-provider", provider?.kind === "local");
     $(".terminal-button", el.root).disabled = provider?.kind !== "sftp";
@@ -524,15 +617,67 @@ async function createFile(side) {
   } catch (error) { toast(error.message, "error"); }
 }
 
+async function copyText(text, successMessage) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      throw new Error("Clipboard API unavailable");
+    }
+  } catch (_) {
+    const field = document.createElement("textarea");
+    field.value = text;
+    field.readOnly = true;
+    field.style.position = "fixed";
+    field.style.opacity = "0";
+    document.body.append(field);
+    field.select();
+    const copied = document.execCommand("copy");
+    field.remove();
+    if (!copied) { toast("无法写入剪贴板", "error"); return; }
+  }
+  toast(successMessage);
+}
+
+function entryDisplayPath(side, entry) {
+  const provider = providerByID(currentProvider(side));
+  if (provider?.kind !== "local") return entry.path;
+  const separator = provider.location.includes("\\") ? "\\" : "/";
+  const root = provider.location.replace(/[\\/]+$/, "");
+  const relative = entry.path.replace(/^[\\/]+/, "").replaceAll("/", separator);
+  return relative ? `${root}${separator}${relative}` : root;
+}
+
+async function copyEntryURL(side, entry) {
+  const provider = providerByID(currentProvider(side));
+  if (!provider || !["ftp", "sftp"].includes(provider.kind)) return;
+  try {
+    const details = await api(`/api/v1/sessions/${encodeURIComponent(provider.id)}`);
+    const host = details.host.includes(":") && !details.host.startsWith("[") ? `[${details.host}]` : details.host;
+    const user = encodeURIComponent(details.user || (details.protocol === "ftp" ? "anonymous" : ""));
+    const filePath = `/${entry.path.split("/").filter(Boolean).map(encodeURIComponent).join("/")}`;
+    const url = `${details.protocol}://${user}@${host}:${details.port}${filePath}`;
+    await copyText(url, "URL 已复制");
+  } catch (error) { toast(error.message, "error"); }
+}
+
 function showFileMenu(event, side, entry) {
-  showContextMenu(event.clientX, event.clientY, [
+  const provider = providerByID(currentProvider(side));
+  const items = [
     { label: side === "left" ? "上传到右侧" : "下载到左侧", action: () => transferEntry(side, side === "left" ? "right" : "left", entry) },
     { label: "打开", action: () => openEntry(side, state.panels[side].entries.indexOf(entry)) },
+    { separator: true },
+    { label: "复制路径", action: () => copyText(entryDisplayPath(side, entry), "路径已复制") },
+  ];
+  if (["ftp", "sftp"].includes(provider?.kind)) items.push({ label: "复制 URL", action: () => copyEntryURL(side, entry) });
+  items.push(
+    { separator: true },
     { label: "删除", danger: true, action: () => deleteEntry(side, entry) },
     { separator: true },
     { label: "新增目录", action: () => createDirectory(side) },
     { label: "新增文件", action: () => createFile(side) },
-  ]);
+  );
+  showContextMenu(event.clientX, event.clientY, items);
 }
 
 function showBlankMenu(event, side) {
@@ -546,6 +691,13 @@ function showContextMenu(x, y, items) {
   const menu = $("#contextMenu"); menu.replaceChildren();
   for (const item of items) {
     if (item.separator) { menu.append(document.createElement("hr")); continue; }
+    if (item.heading) {
+      const heading = document.createElement("span");
+      heading.className = "menu-heading";
+      heading.textContent = item.heading;
+      menu.append(heading);
+      continue;
+    }
     const button = document.createElement("button");
     button.textContent = item.label;
     if (item.danger) button.className = "danger";
@@ -553,7 +705,7 @@ function showContextMenu(x, y, items) {
     menu.append(button);
   }
   menu.classList.add("open");
-  const width = 190, height = items.length * 30;
+  const width = menu.offsetWidth, height = menu.offsetHeight;
   menu.style.left = `${Math.min(x, window.innerWidth - width - 6)}px`;
   menu.style.top = `${Math.min(y, window.innerHeight - height - 6)}px`;
 }
@@ -615,8 +767,9 @@ async function openEditor(side, entry) {
   if (state.editor?.dirty && !confirm("当前文件有未保存的修改，确定放弃并打开其他文件？")) return;
   const tab = currentTab(side);
   state.editor = null;
-	closeEditorFind();
+  closeEditorFind();
   $("#editorTitle").textContent = entry.path;
+	$("#editorTitle").title = entry.path;
 	$("#editorDirty").classList.add("hidden");
   $("#editorContent").value = "";
   $("#editorHighlight").textContent = "";
@@ -635,6 +788,7 @@ async function openEditor(side, entry) {
 	  size: result.size ?? new TextEncoder().encode(result.content).length, lineCount: 0, matchCase: false,
 	};
     $("#editorTitle").textContent = entry.path;
+	$("#editorTitle").title = entry.path;
     $("#editorContent").value = result.content;
 	$("#syntaxMode").value = "auto";
 	refreshEditorDisplay();
@@ -924,6 +1078,7 @@ function showImageAt(index) {
   image.src = `/api/v1/files/raw?provider=${encodeURIComponent(state.image.provider)}&path=${encodeURIComponent(entry.path)}`;
   image.alt = entry.name;
   $("#imageTitle").textContent = entry.path;
+  $("#imageTitle").title = entry.path;
   $("#imagePosition").textContent = `${state.image.index + 1} / ${count}　${entry.name}`;
   $("#previousImage").disabled = count < 2;
   $("#nextImage").disabled = count < 2;
@@ -963,6 +1118,7 @@ function openMedia(side, entry) {
   const message = $("#mediaMessage");
   const source = mediaURL(provider, entry.path);
   $("#mediaTitle").textContent = entry.path;
+  $("#mediaTitle").title = entry.path;
   $("#mediaState").textContent = "正在加载";
   message.classList.remove("visible");
   message.textContent = "";
@@ -1201,6 +1357,7 @@ async function saveConnection(form, connectAfterSave) {
       data.private_key = imported.path;
     }
     const provider = await api("/api/v1/sessions", { method: "POST", body: JSON.stringify(data) });
+    hideSessionGroupMenu();
     $("#connectionDialog").close(); form.reset();
 	prepareNewSession(false);
     await loadProviders();
@@ -1213,6 +1370,7 @@ async function saveConnection(form, connectAfterSave) {
 
 function prepareNewSession(show = true) {
 	const form = $("#connectionForm");
+	hideSessionGroupMenu();
 	form.reset();
 	form.elements.id.value = "";
 	$("#connectionDialogTitle").textContent = "添加会话";
@@ -1234,6 +1392,7 @@ async function editSession(id) {
 	try {
 		const details = await api(`/api/v1/sessions/${encodeURIComponent(id)}`);
 		const form = $("#connectionForm");
+		hideSessionGroupMenu();
 		form.reset();
 		for (const field of ["id", "name", "group", "host", "port", "user", "private_key", "fingerprint"]) {
 			if (form.elements[field] && details[field] !== undefined) form.elements[field].value = details[field] ?? "";
@@ -1254,6 +1413,17 @@ async function editSession(id) {
 		$("#connectionDialogTitle").textContent = `会话属性 · ${details.name}`;
 		$("#connectionDialog").showModal();
 	} catch (error) { toast(error.message, "error"); }
+}
+
+async function copySession(provider) {
+	try {
+		const duplicate = await api(`/api/v1/sessions/${encodeURIComponent(provider.id)}/copy`, { method: "POST" });
+		await loadProviders();
+		toast(`已复制为“${duplicate.name}”`);
+		await editSession(duplicate.id);
+	} catch (error) {
+		toast(`${error.message}${error.payload?.detail ? `：${error.payload.detail}` : ""}`, "error");
+	}
 }
 
 async function deleteSession(provider) {
@@ -1370,16 +1540,197 @@ function navigatePathInput(side, value) {
   if (provider?.kind !== "local") {
     tab.path = value; loadPanel(side); return;
   }
-  const root = provider.location || "";
-  const normalizedValue = value.replaceAll("/", "\\").toLowerCase();
-  const normalizedRoot = root.replaceAll("/", "\\").replace(/\\+$/, "").toLowerCase();
-  if (normalizedRoot && (normalizedValue === normalizedRoot || normalizedValue.startsWith(`${normalizedRoot}\\`))) {
-    let relative = value.slice(root.length).replaceAll("\\", "/");
-    tab.path = `/${relative.replace(/^\/+/, "")}`;
+  const providerPath = localProviderPath(provider, value);
+  if (providerPath !== null) {
+    tab.path = providerPath;
     loadPanel(side);
     return;
   }
   createLocalTab(side, value);
+}
+
+function localProviderPath(provider, value) {
+  const root = (provider.location || "").replace(/[\\/]+$/, "");
+  const normalizedValue = value.replaceAll("/", "\\").toLowerCase();
+  const normalizedRoot = root.replaceAll("/", "\\").toLowerCase();
+  if (!normalizedRoot || (normalizedValue !== normalizedRoot && !normalizedValue.startsWith(`${normalizedRoot}\\`))) return null;
+  const relative = value.slice(root.length).replaceAll("\\", "/").replace(/^\/+/, "");
+  return relative ? `/${relative}` : "/";
+}
+
+function legacyBookmarkStore() {
+  try {
+    const value = JSON.parse(localStorage.getItem(BOOKMARKS_STORAGE));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch (_) { return {}; }
+}
+
+function bookmarkProviderKey(provider) {
+  return provider?.kind === "local" ? "local" : provider?.id || "";
+}
+
+function providerBookmarks(key) {
+  const entries = state.bookmarks[key];
+  if (!Array.isArray(entries)) return [];
+  return entries.filter((entry) => entry && typeof entry.path === "string" && typeof entry.label === "string").map((entry) => ({ ...entry }));
+}
+
+async function saveProviderBookmarks(key, entries) {
+  const previous = state.bookmarks[key];
+  if (entries.length) state.bookmarks[key] = entries.map((entry) => ({ ...entry }));
+  else delete state.bookmarks[key];
+  try {
+    await api("/api/v1/bookmarks", { method: "PUT", body: JSON.stringify({ key, entries }) });
+  } catch (error) {
+    if (previous) state.bookmarks[key] = previous;
+    else delete state.bookmarks[key];
+    throw error;
+  }
+}
+
+function localBookmarkPath(value) {
+  return value.replaceAll("/", "\\").replace(/\\+$/, "").toLocaleLowerCase();
+}
+
+function bookmarkPathsEqual(key, left, right) {
+  return key === "local" ? localBookmarkPath(left) === localBookmarkPath(right) : left === right;
+}
+
+function isAbsoluteWindowsPath(value) {
+  return /^\\\\/.test(value) || /^[a-zA-Z]:[\\/]/.test(value);
+}
+
+async function loadBookmarks() {
+  const stored = await api("/api/v1/bookmarks");
+  state.bookmarks = stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
+  try {
+    await migrateLegacyBookmarks();
+  } catch (error) {
+    toast(`旧书签迁移失败：${error.message}`, "error");
+  }
+}
+
+async function migrateLegacyBookmarks() {
+  const legacy = legacyBookmarkStore();
+  if (!Object.keys(legacy).length) return;
+  const merged = {};
+  for (const [key, entries] of Object.entries(state.bookmarks)) merged[key] = providerBookmarks(key);
+  for (const [key, entries] of Object.entries(legacy)) {
+    if (!Array.isArray(entries)) continue;
+    const provider = providerByID(key);
+    for (const entry of entries) {
+      if (!entry || typeof entry.path !== "string" || typeof entry.label !== "string") continue;
+      const local = key === "local" || provider?.kind === "local" || isAbsoluteWindowsPath(entry.label);
+      const target = local ? "local" : key;
+      const candidate = local ? { path: entry.label, label: entry.label } : { path: entry.path, label: entry.label };
+      if (!merged[target]) merged[target] = [];
+      const targetEntries = merged[target];
+      if (!targetEntries.some((item) => bookmarkPathsEqual(target, item.path, candidate.path))) targetEntries.push(candidate);
+    }
+  }
+  for (const [key, entries] of Object.entries(merged)) {
+    entries.sort((a, b) => a.label.localeCompare(b.label, "zh-CN", { numeric: true }));
+    await saveProviderBookmarks(key, entries);
+  }
+  localStorage.removeItem(BOOKMARKS_STORAGE);
+}
+
+function currentBookmarkCandidate(side) {
+  const tab = currentTab(side);
+  if (!tab) return null;
+  const provider = providerByID(tab.provider);
+  const input = panelElements(side).path.value.trim();
+  if (!input) return { path: tab.path, label: tab.displayPath || tab.path, valid: true };
+  if (provider?.kind === "local") {
+    return { path: input, label: input, valid: true };
+  }
+  const path = input.startsWith("/") ? input : `/${input}`;
+  return { path, label: input, valid: true };
+}
+
+function updateBookmarkControl(side) {
+  const tab = currentTab(side);
+  const button = $(".bookmark-toggle", panelElements(side).root);
+  if (!button) return;
+  const provider = tab ? providerByID(tab.provider) : null;
+  const key = bookmarkProviderKey(provider);
+  const candidate = currentBookmarkCandidate(side);
+  const active = Boolean(tab && candidate?.valid && providerBookmarks(key).some((entry) => bookmarkPathsEqual(key, entry.path, candidate.path)));
+  button.disabled = !tab;
+  button.classList.toggle("active", active);
+  $("span", button).textContent = active ? "★" : "☆";
+  button.title = active ? "删除当前路径书签" : "添加当前路径书签";
+  button.setAttribute("aria-label", button.title);
+}
+
+async function toggleBookmark(side) {
+  const tab = currentTab(side);
+  if (!tab) return;
+  const provider = providerByID(tab.provider);
+  const key = bookmarkProviderKey(provider);
+  const candidate = currentBookmarkCandidate(side);
+  const entries = providerBookmarks(key);
+  const index = entries.findIndex((entry) => bookmarkPathsEqual(key, entry.path, candidate.path));
+  try {
+    if (index >= 0) {
+      entries.splice(index, 1);
+      await saveProviderBookmarks(key, entries);
+      toast("已删除当前路径书签");
+    } else {
+      entries.push({ path: candidate.path, label: candidate.label });
+      entries.sort((a, b) => a.label.localeCompare(b.label, "zh-CN", { numeric: true }));
+      await saveProviderBookmarks(key, entries);
+      toast("已添加当前路径书签");
+    }
+  } catch (error) {
+    toast(error.message, "error");
+  }
+  for (const item of ["left", "right"]) updateBookmarkControl(item);
+}
+
+function showBookmarkMenu(side, anchor) {
+  const tab = currentTab(side);
+  if (!tab) return;
+  const provider = providerByID(tab.provider);
+  const key = bookmarkProviderKey(provider);
+  state.bookmarkSide = side;
+  const menu = $("#bookmarkMenu");
+  const entries = providerBookmarks(key);
+  if (!entries.length) {
+    menu.innerHTML = '<div class="empty-row">当前服务器还没有书签</div>';
+  } else {
+    menu.replaceChildren(...entries.map((entry) => {
+      const button = document.createElement("button");
+      button.textContent = entry.label;
+      button.title = entry.label;
+      button.addEventListener("click", () => {
+        hideBookmarkMenu();
+        const active = currentTab(side);
+        if (!active || active.provider !== tab.provider) return;
+        if (provider?.kind === "local") navigatePathInput(side, entry.path);
+        else { active.path = entry.path; loadPanel(side); }
+      });
+      return button;
+    }));
+  }
+  menu.classList.add("open");
+  anchor.setAttribute("aria-expanded", "true");
+  const rect = anchor.getBoundingClientRect();
+  menu.style.left = `${Math.max(6, Math.min(rect.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 6))}px`;
+  menu.style.top = `${Math.min(rect.bottom + 2, window.innerHeight - menu.offsetHeight - 6)}px`;
+}
+
+function toggleBookmarkMenu(side, anchor) {
+  if ($("#bookmarkMenu").classList.contains("open") && state.bookmarkSide === side) {
+    hideBookmarkMenu();
+    return;
+  }
+  showBookmarkMenu(side, anchor);
+}
+
+function hideBookmarkMenu() {
+  $("#bookmarkMenu").classList.remove("open");
+  $$(".bookmark-menu-button").forEach((button) => button.setAttribute("aria-expanded", "false"));
 }
 
 function showTerminalMenu(side, anchor) {
@@ -1400,6 +1751,21 @@ function showTerminalMenu(side, anchor) {
 
 function hideTerminalMenu() {
   $("#terminalMenu").classList.remove("open");
+}
+
+async function openSessionTerminal(providerID, placement) {
+  let provider = providerByID(providerID);
+  if (!provider || provider.kind !== "sftp") return;
+  if (!provider.connected) {
+    if (!await connectSavedSession(providerID)) return;
+    await loadProviders();
+    renderTabs("left");
+    renderTabs("right");
+    provider = providerByID(providerID);
+  }
+  if (!provider?.connected) return;
+  state.terminalProvider = providerID;
+  await launchTerminal(placement);
 }
 
 async function launchTerminal(placement) {
@@ -1433,8 +1799,11 @@ async function launchTerminal(placement) {
 function bindPanel(side) {
   const el = panelElements(side);
   el.root.addEventListener("mousedown", () => setActivePane(side));
+  el.path.addEventListener("input", () => updateBookmarkControl(side));
   el.path.addEventListener("keydown", (event) => { if (event.key === "Enter") navigatePathInput(side, el.path.value); });
   $(".local-tree-button", el.root).addEventListener("click", (event) => { event.stopPropagation(); showLocalTree(side, event.currentTarget); });
+  $(".bookmark-toggle", el.root).addEventListener("click", (event) => { event.stopPropagation(); toggleBookmark(side); });
+  $(".bookmark-menu-button", el.root).addEventListener("click", (event) => { event.stopPropagation(); toggleBookmarkMenu(side, event.currentTarget); });
   $(".up-button", el.root).addEventListener("click", () => { currentTab(side).path = parentPath(currentPath(side)); loadPanel(side); });
   $(".refresh-button", el.root).addEventListener("click", () => loadPanel(side));
   $(".terminal-button", el.root).addEventListener("click", (event) => {
@@ -1514,7 +1883,7 @@ function initializeQueueResize() {
 async function main() {
   try {
     const session = await api("/api/v1/session"); state.csrf = session.csrf;
-    await loadProviders(false); initializeWorkspace(); renderSessionTree();
+    await loadProviders(false); await loadBookmarks(); initializeWorkspace(); renderSessionTree();
     bindPanel("left"); bindPanel("right"); renderTabs("left"); renderTabs("right");
     initializeQueueResize();
 	await loadPanel("left");
@@ -1527,6 +1896,8 @@ async function main() {
 }
 
 $("#sidebarAdd").addEventListener("click", () => prepareNewSession());
+$("#sessionGroupControl > button").addEventListener("click", toggleSessionGroupMenu);
+$("#sessionGroupControl input[name=group]").addEventListener("keydown", handleSessionGroupKey);
 $("#connectionForm").addEventListener("submit", (event) => { event.preventDefault(); saveConnection(event.currentTarget, event.submitter?.value === "connect"); });
 $("#connectionProtocol").addEventListener("change", (event) => setConnectionProtocol(event.target.value));
 $("#connectionAuthMethod").addEventListener("change", updateConnectionAuthFields);
@@ -1606,8 +1977,10 @@ window.addEventListener("beforeunload", (event) => {
 });
 document.addEventListener("dragend", clearDropTargets);
 document.addEventListener("mousedown", (event) => {
+  if (!event.target.closest("#sessionGroupControl")) hideSessionGroupMenu();
   if (!event.target.closest("#contextMenu")) hideContextMenu();
   if (!event.target.closest("#localTreePopup, .local-tree-button, .new-local-tab")) hideLocalTree();
+  if (!event.target.closest("#bookmarkMenu, .bookmark-control")) hideBookmarkMenu();
   if (!event.target.closest("#terminalMenu, .terminal-button")) hideTerminalMenu();
 });
 document.addEventListener("keydown", (event) => {
@@ -1617,7 +1990,7 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "+" || event.key === "=") setImageZoom(state.image.zoom * 1.2);
   if (event.key === "-") setImageZoom(state.image.zoom / 1.2);
 });
-window.addEventListener("blur", () => { hideContextMenu(); hideLocalTree(); hideTerminalMenu(); });
+window.addEventListener("blur", () => { hideContextMenu(); hideLocalTree(); hideBookmarkMenu(); hideTerminalMenu(); });
 setInterval(() => {
   if (state.taskFilter === "queue" && state.tasks.some((task) => ["running", "verifying"].includes(task.status))) renderTaskList();
 }, 1000);

@@ -47,17 +47,21 @@ const (
 	mfGray      = 0x00000001
 	mfSeparator = 0x00000800
 
-	tpmRightButton = 0x0002
-	tpmReturnCmd   = 0x0100
+	tpmRightButton  = 0x0002
+	tpmReturnCmd    = 0x0100
+	tdfUseHIconMain = 0x0002
+	tdcbfOKButton   = 0x0001
 
 	menuOpen       = 1001
 	menuPowerShell = 1002
-	menuQuit       = 1003
+	menuAbout      = 1003
+	menuQuit       = 1004
 )
 
 var (
 	user32                  = windows.NewLazySystemDLL("user32.dll")
 	shell32                 = windows.NewLazySystemDLL("shell32.dll")
+	comctl32                = windows.NewLazySystemDLL("comctl32.dll")
 	kernel32                = windows.NewLazySystemDLL("kernel32.dll")
 	procRegisterClassEx     = user32.NewProc("RegisterClassExW")
 	procCreateWindowEx      = user32.NewProc("CreateWindowExW")
@@ -76,6 +80,7 @@ var (
 	procGetCursorPos        = user32.NewProc("GetCursorPos")
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 	procShellNotifyIcon     = shell32.NewProc("Shell_NotifyIconW")
+	procTaskDialogIndirect  = comctl32.NewProc("TaskDialogIndirect")
 	procGetModuleHandle     = kernel32.NewProc("GetModuleHandleW")
 	activeTray              *nativeTray
 )
@@ -126,6 +131,33 @@ type notifyIconData struct {
 	InfoFlags   uint32
 	GUID        windows.GUID
 	BalloonIcon uintptr
+}
+
+type taskDialogConfig struct {
+	Size                 uint32
+	Parent               uintptr
+	Instance             uintptr
+	Flags                uint32
+	CommonButtons        uint32
+	WindowTitle          *uint16
+	MainIcon             uintptr
+	MainInstruction      *uint16
+	Content              *uint16
+	ButtonCount          uint32
+	Buttons              uintptr
+	DefaultButton        int32
+	RadioButtonCount     uint32
+	RadioButtons         uintptr
+	DefaultRadioButton   int32
+	VerificationText     *uint16
+	ExpandedInformation  *uint16
+	ExpandedControlText  *uint16
+	CollapsedControlText *uint16
+	FooterIcon           uintptr
+	Footer               *uint16
+	Callback             uintptr
+	CallbackData         uintptr
+	Width                uint32
 }
 
 type nativeTray struct {
@@ -322,6 +354,8 @@ func (t *nativeTray) showMenu() {
 	appendMenu(menu, mfString, menuOpen, "打开 Floe")
 	appendMenu(menu, mfString, menuPowerShell, "打开 PowerShell")
 	appendMenu(menu, mfSeparator, 0, "")
+	appendMenu(menu, mfString, menuAbout, "关于 Floe")
+	appendMenu(menu, mfSeparator, 0, "")
 	appendMenu(menu, mfString, menuQuit, "退出 Floe")
 
 	var cursor point
@@ -338,8 +372,26 @@ func (t *nativeTray) showMenu() {
 				platformFatal("无法打开 Windows Terminal。\n\n" + err.Error())
 			}
 		}()
+	case menuAbout:
+		t.showAbout()
 	case menuQuit:
 		_, _, _ = procPostMessage.Call(t.window, wmClose, 0, 0)
+	}
+}
+
+func (t *nativeTray) showAbout() {
+	title, _ := windows.UTF16PtrFromString("关于 Floe")
+	name, _ := windows.UTF16PtrFromString("Floe")
+	details, _ := windows.UTF16PtrFromString("远程文件工作区\n\n作者：Jerry\n版本：" + app.Version)
+	config := taskDialogConfig{
+		Size: uint32(unsafe.Sizeof(taskDialogConfig{})), Parent: t.window,
+		Flags: tdfUseHIconMain, CommonButtons: tdcbfOKButton,
+		WindowTitle: title, MainIcon: t.icon, MainInstruction: name, Content: details,
+	}
+	result, _, callErr := procTaskDialogIndirect.Call(uintptr(unsafe.Pointer(&config)), 0, 0, 0)
+	if int32(result) < 0 {
+		log.Printf("show Floe about dialog: %v (HRESULT 0x%x)", callErr, result)
+		messageBox("Floe\n\n远程文件工作区\n作者：Jerry\n版本："+app.Version, windows.MB_OK|windows.MB_ICONINFORMATION)
 	}
 }
 
