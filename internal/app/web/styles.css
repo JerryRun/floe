@@ -212,9 +212,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .dialog-actions, .editor-foot { height: 43px; display: flex; align-items: center; justify-content: flex-end; gap: 7px; padding: 0 10px; border-top: 1px solid var(--line); background: var(--chrome); }
 .dialog-actions button, .editor-foot button { min-width: 66px; height: 27px; border: 1px solid var(--line); background: var(--panel); }
 button.primary { border-color: #116a74; background: var(--accent); color: white; }
-.editor-dialog { width: min(860px, 88vw); height: min(680px, 84vh); }
+.editor-dialog { width: min(860px, 88vw); height: min(680px, 84vh); overflow: hidden; }
 .editor-dialog .hidden { display: none !important; }
-.editor-dialog[open] { display: grid; grid-template-rows: 38px auto minmax(0, 1fr) 43px; }
+.editor-dialog[open] { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: 38px auto minmax(0, 1fr) 43px; }
 /* Keep the body and footer in their intended tracks when the find bar is display:none. */
 .editor-dialog > .editor-head { grid-row: 1; }
 .editor-dialog > .editor-find { grid-row: 2; }
@@ -234,6 +234,7 @@ button.primary { border-color: #116a74; background: var(--accent); color: white;
 .editor-find button { min-width: 26px; height: 25px; padding: 0 6px; border: 1px solid transparent; background: transparent; font-size: 11px; }
 .editor-find button:hover, .editor-find button.active { border-color: var(--line); background: var(--chrome-dark); }
 .editor-find button .material-symbols-rounded { font-size: 17px; }
+#editorFindNext .material-symbols-rounded { transform: rotate(180deg); }
 .editor-code { min-width: 0; min-height: 0; position: relative; overflow: hidden; background: #fbfcfc; }
 .editor-layers { position: absolute; inset: 0 0 0 48px; min-width: 0; overflow: hidden; }
 #editorLineNumbers { position: absolute; inset: 0 auto 0 0; width: 48px; margin: 0; padding: 12px 8px 12px 0; overflow: hidden; border-right: 1px solid var(--line-soft); color: #899298; background: #f4f6f7; text-align: right; user-select: none; font-family: var(--mono); font-size: 13px; line-height: 1.55; }
