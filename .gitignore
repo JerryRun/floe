@@ -1,0 +1,22 @@
+# Build outputs and local tool caches
+/dist/
+/.cache/
+/.tools/
+
+# Runtime data must never enter the source repository
+/sessions.json
+/session.key
+/tasks.json
+/activity.json
+/floe.log
+/keys/
+/terminal/
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.tmp
+*.part
+Floe-new.exe
