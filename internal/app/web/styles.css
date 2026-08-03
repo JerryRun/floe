@@ -215,6 +215,11 @@ button.primary { border-color: #116a74; background: var(--accent); color: white;
 .editor-dialog { width: min(860px, 88vw); height: min(680px, 84vh); }
 .editor-dialog .hidden { display: none !important; }
 .editor-dialog[open] { display: grid; grid-template-rows: 38px auto minmax(0, 1fr) 43px; }
+/* Keep the body and footer in their intended tracks when the find bar is display:none. */
+.editor-dialog > .editor-head { grid-row: 1; }
+.editor-dialog > .editor-find { grid-row: 2; }
+.editor-dialog > .editor-code { grid-row: 3; }
+.editor-dialog > .editor-foot { grid-row: 4; }
 .dialog.maximized { width: 100vw; max-width: none; height: 100vh; max-height: none; margin: 0; border: 0; }
 .dialog-head-actions { display: flex; align-items: center; }
 .dialog-head-actions select { height: 25px; margin-right: 5px; border: 1px solid var(--line); background: var(--panel); font-size: 11px; }
