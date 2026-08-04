@@ -124,7 +124,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .sort-indicator.descending { transform: rotate(180deg); }
 .file-pane.grid-view .column-head { display: none; }
 .file-pane.grid-view { grid-template-rows: 31px 35px minmax(0, 1fr) 23px; }
-.file-viewport { min-width: 0; min-height: 0; height: 100%; position: relative; overflow: auto; overscroll-behavior: contain; background: var(--panel); }
+.file-viewport { min-width: 0; min-height: 0; height: 100%; position: relative; overflow: auto; overscroll-behavior: contain; background: var(--panel); user-select: none; }
 .file-canvas { position: relative; width: 100%; min-height: 100%; }
 .file-entry { position: absolute; border: 1px solid transparent; background: transparent; cursor: default; text-align: left; }
 .file-entry:hover { background: var(--hover); }

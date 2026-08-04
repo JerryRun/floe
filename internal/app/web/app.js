@@ -15,8 +15,8 @@ const state = {
   bookmarkSide: "",
   terminalProvider: "",
   panels: {
-    left: { tabs: [], active: "", entries: [], selected: null, view: "list", sort: { field: "name", direction: "asc" }, renderQueued: false },
-    right: { tabs: [], active: "", entries: [], selected: null, view: "list", sort: { field: "name", direction: "asc" }, renderQueued: false },
+    left: { tabs: [], active: "", entries: [], selection: new Set(), selectionAnchor: -1, view: "list", sort: { field: "name", direction: "asc" }, renderQueued: false },
+    right: { tabs: [], active: "", entries: [], selection: new Set(), selectionAnchor: -1, view: "list", sort: { field: "name", direction: "asc" }, renderQueued: false },
   },
   editor: null,
   image: null,
@@ -283,7 +283,8 @@ async function openSession(side, providerID, path = "") {
     tab.path = initialPath;
   }
   panel.active = providerID;
-  panel.selected = null;
+  panel.selection.clear();
+  panel.selectionAnchor = -1;
   setActivePane(side);
   renderTabs(side);
   saveWorkspace();
@@ -387,12 +388,13 @@ async function loadPanel(side, allowReconnect = true) {
 	  if (connected) return loadPanel(side, false);
 	}
     panel.entries = [];
-    panel.selected = null;
+    panel.selection.clear();
+    panel.selectionAnchor = -1;
     el.path.value = tab.path;
     updateBookmarkControl(side);
     el.canvas.innerHTML = '<div class="empty-files">双击左侧会话以连接</div>';
     el.count.textContent = "未连接";
-    el.selection.textContent = "";
+    updateSelectionLabel(side);
     el.root.classList.remove("local-provider");
     return;
   }
@@ -404,14 +406,15 @@ async function loadPanel(side, allowReconnect = true) {
     tab.path = result.path;
     tab.displayPath = result.display_path || result.path;
     panel.entries = sortEntries(result.entries || [], panel.sort);
-    panel.selected = null;
+    panel.selection.clear();
+    panel.selectionAnchor = -1;
     el.path.value = tab.displayPath;
     updateBookmarkControl(side);
     const provider = providerByID(tab.provider);
     el.root.classList.toggle("local-provider", provider?.kind === "local");
     $(".terminal-button", el.root).disabled = provider?.kind !== "sftp";
     el.count.textContent = `${panel.entries.length.toLocaleString()} 项`;
-    el.selection.textContent = "";
+    updateSelectionLabel(side);
     el.viewport.scrollTop = 0;
     el.root.classList.toggle("grid-view", panel.view === "grid");
     el.viewButton.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">${panel.view === "grid" ? "view_list" : "grid_view"}</span>`;
@@ -463,8 +466,9 @@ function changeSort(side, field) {
   if (panel.sort.field === field) panel.sort.direction = panel.sort.direction === "asc" ? "desc" : "asc";
   else panel.sort = { field, direction: field === "name" ? "asc" : "desc" };
   panel.entries = sortEntries(panel.entries, panel.sort);
-  panel.selected = null;
-  panelElements(side).selection.textContent = "";
+  panel.selection.clear();
+  panel.selectionAnchor = -1;
+  updateSelectionLabel(side);
   panelElements(side).viewport.scrollTop = 0;
   updateSortHeaders(side);
   renderPanel(side);
@@ -497,7 +501,9 @@ function renderPanel(side) {
     const row = Math.floor(index / columns);
     const column = index % columns;
     const node = document.createElement("div");
-    node.className = `file-entry ${panel.view}${panel.selected?.path === entry.path ? " selected" : ""}`;
+    node.className = `file-entry ${panel.view}${panel.selection.has(entry.path) ? " selected" : ""}`;
+    node.setAttribute("role", "option");
+    node.setAttribute("aria-selected", String(panel.selection.has(entry.path)));
     node.style.transform = `translate(${column * width}px, ${row * cellHeight}px)`;
     node.style.width = `${list ? viewport.clientWidth : width - 6}px`;
     node.draggable = true;
@@ -505,17 +511,19 @@ function renderPanel(side) {
     const visual = fileVisual(entry, side, panel.view);
     node.dataset.index = String(index);
     node.innerHTML = `<span class="file-name"><i class="file-icon${visual.preview ? " image-preview" : ""}">${visual.html}</i><b class="file-label">${escapeHTML(entry.name)}</b></span><span class="file-size">${entry.is_dir ? "" : formatBytes(entry.size)}</span><span class="file-time">${formatTime(entry.modified)}</span><span class="file-mode">${escapeHTML(entry.mode)}</span>`;
-    node.addEventListener("click", () => selectEntry(side, index));
+    node.addEventListener("click", (event) => selectEntry(side, index, event));
     node.addEventListener("dblclick", () => openEntry(side, index));
     node.addEventListener("dragstart", (event) => {
-      selectEntry(side, index);
+      if (!panel.selection.has(entry.path)) selectEntry(side, index);
       node.classList.add("dragging");
       event.dataTransfer.effectAllowed = "copy";
-      event.dataTransfer.setData(DND_FILE, JSON.stringify({ side, index }));
+      event.dataTransfer.setData(DND_FILE, JSON.stringify({ side, paths: selectedEntries(side).map((item) => item.path) }));
     });
     node.addEventListener("dragend", () => { node.classList.remove("dragging"); clearDropTargets(); });
     node.addEventListener("contextmenu", (event) => {
-      event.preventDefault(); event.stopPropagation(); selectEntry(side, index); showFileMenu(event, side, entry);
+      event.preventDefault(); event.stopPropagation();
+      if (!panel.selection.has(entry.path)) selectEntry(side, index);
+      showFileMenu(event, side, entry);
     });
     canvas.append(node);
   }
@@ -528,10 +536,47 @@ function queueRender(side) {
   requestAnimationFrame(() => { panel.renderQueued = false; renderPanel(side); });
 }
 
-function selectEntry(side, index) {
+function selectedEntries(side) {
   const panel = state.panels[side];
-  panel.selected = panel.entries[index];
-  panelElements(side).selection.textContent = panel.selected.name;
+  return panel.entries.filter((entry) => panel.selection.has(entry.path));
+}
+
+function updateSelectionLabel(side) {
+  const entries = selectedEntries(side);
+  const label = panelElements(side).selection;
+  label.textContent = entries.length > 1 ? `已选择 ${entries.length.toLocaleString()} 项` : entries[0]?.name || "";
+  label.title = entries.map((entry) => entry.name).join("\n");
+}
+
+function clearSelection(side) {
+  const panel = state.panels[side];
+  if (!panel.selection.size) return;
+  panel.selection.clear();
+  panel.selectionAnchor = -1;
+  updateSelectionLabel(side);
+  renderPanel(side);
+}
+
+function selectEntry(side, index, event = {}) {
+  const panel = state.panels[side];
+  const entry = panel.entries[index];
+  if (!entry) return;
+  const additive = Boolean(event.ctrlKey || event.metaKey);
+  if (event.shiftKey && panel.selectionAnchor >= 0) {
+    const next = additive ? new Set(panel.selection) : new Set();
+    const start = Math.min(panel.selectionAnchor, index);
+    const end = Math.max(panel.selectionAnchor, index);
+    for (let item = start; item <= end; item++) next.add(panel.entries[item].path);
+    panel.selection = next;
+  } else if (additive) {
+    if (panel.selection.has(entry.path)) panel.selection.delete(entry.path);
+    else panel.selection.add(entry.path);
+    panel.selectionAnchor = index;
+  } else {
+    panel.selection = new Set([entry.path]);
+    panel.selectionAnchor = index;
+  }
+  updateSelectionLabel(side);
   setActivePane(side);
   renderPanel(side);
 }
@@ -569,23 +614,31 @@ function parentPath(value) {
 }
 function joinPath(parent, name) { return `${parent === "/" ? "" : parent}/${name}`; }
 
-async function transferEntry(fromSide, toSide, entry) {
-  if (!entry) { toast("请选择文件", "error"); return; }
+async function transferEntries(fromSide, toSide, entries) {
+  const uniqueEntries = [...new Map((entries || []).map((entry) => [entry.path, entry])).values()];
+  if (!uniqueEntries.length) { toast("请选择文件", "error"); return; }
   const source = currentTab(fromSide);
   const target = currentTab(toSide);
   if (!source || !target) return;
-  const targetPath = joinPath(target.path, entry.name);
-  if (source.provider === target.provider && entry.path === targetPath) { toast("源文件和目标位置相同", "error"); return; }
-  try {
-    await api("/api/v1/transfers", {
+  const transferable = uniqueEntries.filter((entry) => source.provider !== target.provider || entry.path !== joinPath(target.path, entry.name));
+  if (!transferable.length) { toast("所选项目的源和目标位置相同", "error"); return; }
+  const results = await Promise.allSettled(transferable.map((entry) => api("/api/v1/transfers", {
       method: "POST",
-      body: JSON.stringify({ source_provider: source.provider, source_path: entry.path, target_provider: target.provider, target_path: targetPath, concurrency: 4 }),
-    });
+      body: JSON.stringify({ source_provider: source.provider, source_path: entry.path, target_provider: target.provider, target_path: joinPath(target.path, entry.name), concurrency: 4 }),
+    })));
+  const succeeded = results.filter((result) => result.status === "fulfilled").length;
+  const failed = results.length - succeeded;
+  if (succeeded) {
     $("#transferQueue").classList.remove("collapsed");
     state.taskFilter = "queue";
     renderTaskList();
-    toast(`开始传输 ${entry.name}`);
-  } catch (error) { toast(error.message, "error"); }
+  }
+  if (failed) {
+    const firstError = results.find((result) => result.status === "rejected")?.reason?.message;
+    toast(succeeded ? `已开始传输 ${succeeded} 项，${failed} 项失败` : firstError || "传输失败", "error");
+  } else {
+    toast(succeeded === 1 ? `开始传输 ${transferable[0].name}` : `已开始传输 ${succeeded} 项`);
+  }
 }
 
 async function deleteEntry(side, entry) {
@@ -661,8 +714,12 @@ async function copyEntryURL(side, entry) {
 
 function showFileMenu(event, side, entry) {
   const provider = providerByID(currentProvider(side));
+  const selection = selectedEntries(side);
+  const transferLabel = selection.length > 1
+    ? `${side === "left" ? "上传" : "下载"}选中的 ${selection.length} 项`
+    : side === "left" ? "上传到右侧" : "下载到左侧";
   const items = [
-    { label: side === "left" ? "上传到右侧" : "下载到左侧", action: () => transferEntry(side, side === "left" ? "right" : "left", entry) },
+    { label: transferLabel, action: () => transferEntries(side, side === "left" ? "right" : "left", selection) },
     { label: "打开", action: () => openEntry(side, state.panels[side].entries.indexOf(entry)) },
     { separator: true },
     { label: "复制路径", action: () => copyText(entryDisplayPath(side, entry), "路径已复制") },
@@ -747,7 +804,10 @@ function bindDrops(side) {
     const fileData = event.dataTransfer.getData(DND_FILE);
     if (fileData) {
       const source = JSON.parse(fileData);
-      if (source.side !== side) transferEntry(source.side, side, state.panels[source.side].entries[source.index]);
+      if (source.side !== side) {
+        const paths = new Set(source.paths || []);
+        transferEntries(source.side, side, state.panels[source.side].entries.filter((entry) => paths.has(entry.path)));
+      }
       return;
     }
     const sessionID = event.dataTransfer.getData(DND_SESSION);
@@ -1808,7 +1868,7 @@ function bindPanel(side) {
 	event.stopPropagation();
 	showTerminalMenu(side, event.currentTarget);
   });
-  $(".transfer-file-button", el.root).addEventListener("click", () => transferEntry(side, side === "left" ? "right" : "left", state.panels[side].selected));
+  $(".transfer-file-button", el.root).addEventListener("click", () => transferEntries(side, side === "left" ? "right" : "left", selectedEntries(side)));
   el.viewButton.addEventListener("click", () => {
     const current = state.panels[side];
     current.view = current.view === "list" ? "grid" : "list";
@@ -1816,6 +1876,7 @@ function bindPanel(side) {
   });
   $$(".column-head button[data-sort]", el.root).forEach((button) => button.addEventListener("click", () => changeSort(side, button.dataset.sort)));
   el.viewport.addEventListener("scroll", () => queueRender(side));
+  el.viewport.addEventListener("click", (event) => { if (!event.target.closest(".file-entry")) clearSelection(side); });
   new ResizeObserver(() => queueRender(side)).observe(el.viewport);
   el.viewport.addEventListener("contextmenu", (event) => {
     if (event.target.closest(".file-entry")) return;
