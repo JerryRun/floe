@@ -32,8 +32,7 @@ import (
 var webFiles embed.FS
 
 type session struct {
-	CSRF      string
-	ExpiresAt time.Time
+	CSRF string
 }
 
 type Server struct {
@@ -184,12 +183,12 @@ func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sessionID, csrf := randomToken(32), randomToken(24)
-	s.sessions[sessionID] = session{CSRF: csrf, ExpiresAt: time.Now().Add(12 * time.Hour)}
+	s.sessions[sessionID] = session{CSRF: csrf}
 	s.bootstrapToken = randomToken(32)
 	s.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{
 		Name: "floe_session", Value: sessionID, Path: "/", HttpOnly: true,
-		SameSite: http.SameSiteStrictMode, MaxAge: 12 * 60 * 60,
+		SameSite: http.SameSiteStrictMode,
 	})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
@@ -208,8 +207,8 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 		s.mu.RLock()
 		sess, ok := s.sessions[cookie.Value]
 		s.mu.RUnlock()
-		if !ok || time.Now().After(sess.ExpiresAt) {
-			http.Error(w, "Floe session expired; open Floe from its launcher again", http.StatusUnauthorized)
+		if !ok {
+			http.Error(w, "Floe session missing; open Floe from its launcher again", http.StatusUnauthorized)
 			return
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {

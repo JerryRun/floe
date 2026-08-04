@@ -48,7 +48,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .brand img { width: 22px; height: 22px; border-radius: 4px; }
 
 .app-shell { height: 100vh; min-height: 0; display: grid; grid-template-columns: 210px minmax(0, 1fr); }
-.session-sidebar { min-width: 0; background: var(--chrome); border-right: 1px solid var(--line); display: grid; grid-template-rows: 34px 34px minmax(0, 1fr); }
+.session-sidebar { min-width: 0; min-height: 0; overflow: hidden; background: var(--chrome); border-right: 1px solid var(--line); display: grid; grid-template-rows: 34px 34px minmax(0, 1fr); }
 .sidebar-brand { display: flex; align-items: center; padding: 0 7px 0 9px; border-bottom: 1px solid var(--line); background: #f8f9fa; user-select: none; }
 .session-search { margin: 5px 7px; height: 25px; display: grid; grid-template-columns: 24px minmax(0, 1fr) 25px; align-items: center; border: 1px solid var(--line); background: var(--panel); }
 .session-search > span { text-align: center; color: #46535a; font-size: 17px; }
@@ -56,7 +56,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .session-search button { width: 25px; height: 23px; display: grid; place-items: center; padding: 0; border: 0; border-left: 1px solid var(--line-soft); background: transparent; color: #35464e; }
 .session-search button:hover { background: var(--chrome-dark); }
 .session-search button .material-symbols-rounded { font-size: 17px; }
-.session-tree { overflow: auto; padding: 2px 0 8px; }
+.session-tree { min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; padding: 2px 0 8px; }
 .session-group { user-select: none; }
 .group-head { width: 100%; height: 28px; display: flex; align-items: center; gap: 5px; border: 0; padding: 0 8px; background: transparent; text-align: left; font-weight: 600; }
 .group-head:hover { background: var(--chrome-dark); }
