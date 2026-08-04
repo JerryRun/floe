@@ -31,10 +31,6 @@ import (
 //go:embed web/*
 var webFiles embed.FS
 
-type session struct {
-	CSRF string
-}
-
 type Server struct {
 	dataDir         string
 	manager         *core.Manager
@@ -43,8 +39,6 @@ type Server struct {
 	transfers       *core.TransferEngine
 	connectProvider func(core.ConnectRequest) (core.ProviderInfo, error)
 	activity        *activityLog
-	mu              sync.RWMutex
-	sessions        map[string]session
 	askPassMu       sync.Mutex
 	askPassTokens   map[string]askPassSecret
 	listener        net.Listener
@@ -75,7 +69,6 @@ func New(dataDir string) (*Server, error) {
 		transfers:       core.NewTransferEngine(manager, filepath.Join(dataDir, "tasks.json")),
 		connectProvider: manager.Connect,
 		activity:        newActivityLog(dataDir),
-		sessions:        make(map[string]session),
 		askPassTokens:   make(map[string]askPassSecret),
 	}
 	server.activity.Add("info", "system", "Floe Core 已启动", "")
@@ -119,11 +112,10 @@ func (s *Server) Start(address string) (string, <-chan error, error) {
 	s.origin = origin
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /askpass/{token}", s.askPass)
-	mux.HandleFunc("GET /api/v1/session", s.openSession)
-	mux.Handle("/api/", s.requireSession(http.HandlerFunc(s.api)))
+	mux.HandleFunc("/api/", s.api)
 	mux.HandleFunc("/", s.static)
 	s.httpServer = &http.Server{
-		Handler: securityHeaders(s.requireLocalHost(mux)), ReadHeaderTimeout: 5 * time.Second,
+		Handler: securityHeaders(s.requireLocalAccess(mux)), ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout: 90 * time.Second, MaxHeaderBytes: 1 << 20,
 	}
 	done := make(chan error, 1)
@@ -142,8 +134,7 @@ func friendlyLoopbackOrigin(listenerAddress string) (string, error) {
 	return "http://localhost:" + port, nil
 }
 
-// LaunchURL returns the stable local application URL. Browser sessions are
-// established by GET /api/v1/session when the page loads.
+// LaunchURL returns the stable local application URL.
 func (s *Server) LaunchURL() string {
 	return s.origin + "/"
 }
@@ -170,11 +161,17 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) requireLocalHost(next http.Handler) http.Handler {
+func (s *Server) requireLocalAccess(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.isLocalHost(r.Host) {
 			http.Error(w, "invalid host", http.StatusForbidden)
 			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if origin := r.Header.Get("Origin"); origin != "" && origin != "http://"+r.Host {
+				http.Error(w, "invalid origin", http.StatusForbidden)
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -194,57 +191,6 @@ func (s *Server) isLocalHost(requestHost string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
-}
-
-func (s *Server) openSession(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-	if cookie, err := r.Cookie("floe_session"); err == nil {
-		s.mu.RLock()
-		sess, ok := s.sessions[cookie.Value]
-		s.mu.RUnlock()
-		if ok {
-			writeJSON(w, http.StatusOK, map[string]string{"csrf": sess.CSRF, "name": "Floe"})
-			return
-		}
-	}
-
-	sessionID, csrf := randomToken(32), randomToken(24)
-	s.mu.Lock()
-	s.sessions[sessionID] = session{CSRF: csrf}
-	s.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{
-		Name: "floe_session", Value: sessionID, Path: "/", HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-	})
-	writeJSON(w, http.StatusOK, map[string]string{"csrf": csrf, "name": "Floe"})
-}
-
-func (s *Server) requireSession(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie("floe_session")
-		if err != nil {
-			http.Error(w, "Floe session missing; reload Floe", http.StatusUnauthorized)
-			return
-		}
-		s.mu.RLock()
-		sess, ok := s.sessions[cookie.Value]
-		s.mu.RUnlock()
-		if !ok {
-			http.Error(w, "Floe session missing; reload Floe", http.StatusUnauthorized)
-			return
-		}
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			if origin := r.Header.Get("Origin"); origin != "" && origin != "http://"+r.Host {
-				http.Error(w, "invalid origin", http.StatusForbidden)
-				return
-			}
-			if r.Header.Get("X-Floe-CSRF") != sess.CSRF {
-				http.Error(w, "invalid CSRF token", http.StatusForbidden)
-				return
-			}
-		}
-		next.ServeHTTP(w, r)
-	})
 }
 
 func (s *Server) static(w http.ResponseWriter, r *http.Request) {
@@ -271,6 +217,9 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/session":
+		// Kept for compatibility with pages loaded from pre-v0.2.3 builds.
+		writeJSON(w, http.StatusOK, map[string]string{"csrf": "", "name": "Floe"})
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/providers":
 		writeJSON(w, http.StatusOK, s.providers())
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/bookmarks":

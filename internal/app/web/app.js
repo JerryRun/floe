@@ -1,5 +1,4 @@
 const state = {
-  csrf: "",
   providers: [],
   activePane: "left",
   sessionSelected: "",
@@ -31,16 +30,10 @@ const BOOKMARKS_STORAGE = "floe.bookmarks.v1";
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
-async function api(url, options = {}, retrySession = true) {
+async function api(url, options = {}) {
   const headers = new Headers(options.headers || {});
   if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-  if (options.method && !["GET", "HEAD"].includes(options.method)) headers.set("X-Floe-CSRF", state.csrf);
   const response = await fetch(url, { ...options, headers });
-  if (response.status === 401 && retrySession && url !== "/api/v1/session") {
-    const session = await api("/api/v1/session", {}, false);
-    state.csrf = session.csrf;
-    return api(url, options, false);
-  }
   const type = response.headers.get("content-type") || "";
   const payload = type.includes("application/json") ? await response.json() : { message: await response.text() };
   if (!response.ok) {
@@ -1887,7 +1880,6 @@ function initializeQueueResize() {
 
 async function main() {
   try {
-    const session = await api("/api/v1/session"); state.csrf = session.csrf;
     await loadProviders(false); await loadBookmarks(); initializeWorkspace(); renderSessionTree();
     bindPanel("left"); bindPanel("right"); renderTabs("left"); renderTabs("right");
     initializeQueueResize();
