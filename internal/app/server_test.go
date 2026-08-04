@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -16,23 +17,27 @@ func TestServerUsesFriendlyLocalhostURL(t *testing.T) {
 	}
 }
 
-func TestBrowserSessionDoesNotExpire(t *testing.T) {
-	const token = "bootstrap-token"
+func TestBrowserSessionIsCreatedWithoutBootstrapToken(t *testing.T) {
 	server := &Server{
-		origin:         "http://localhost:47667",
-		bootstrapToken: token,
-		sessions:       make(map[string]session),
+		origin:   "http://localhost:47667",
+		sessions: make(map[string]session),
 	}
-	request := httptest.NewRequest(http.MethodGet, "/bootstrap/"+token, nil)
-	request.SetPathValue("token", token)
+	request := httptest.NewRequest(http.MethodGet, server.origin+"/api/v1/session", nil)
 	response := httptest.NewRecorder()
 
-	server.bootstrap(response, request)
+	server.openSession(response, request)
 
 	result := response.Result()
 	defer result.Body.Close()
-	if result.StatusCode != http.StatusSeeOther {
-		t.Fatalf("bootstrap status = %d, want %d", result.StatusCode, http.StatusSeeOther)
+	if result.StatusCode != http.StatusOK {
+		t.Fatalf("session status = %d, want %d", result.StatusCode, http.StatusOK)
+	}
+	var payload map[string]string
+	if err := json.NewDecoder(result.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["csrf"] == "" {
+		t.Fatal("session response has no CSRF token")
 	}
 	cookies := result.Cookies()
 	if len(cookies) != 1 {
@@ -51,5 +56,19 @@ func TestBrowserSessionDoesNotExpire(t *testing.T) {
 	})).ServeHTTP(protectedResponse, protectedRequest)
 	if protectedResponse.Code != http.StatusNoContent {
 		t.Fatalf("protected request status = %d, want %d", protectedResponse.Code, http.StatusNoContent)
+	}
+}
+
+func TestLocalHostAcceptsLocalhostAndNumericLoopback(t *testing.T) {
+	server := &Server{origin: "http://localhost:47667"}
+	for _, host := range []string{"localhost:47667", "127.0.0.1:47667", "[::1]:47667"} {
+		if !server.isLocalHost(host) {
+			t.Errorf("isLocalHost(%q) = false, want true", host)
+		}
+	}
+	for _, host := range []string{"example.com:47667", "localhost:12345", "localhost"} {
+		if server.isLocalHost(host) {
+			t.Errorf("isLocalHost(%q) = true, want false", host)
+		}
 	}
 }
