@@ -25,6 +25,10 @@ func main() {
 	noOpen := flag.Bool("no-open", false, "do not open the browser automatically")
 	flag.Parse()
 	initLogging(*dataDir)
+	preferences, preferencesErr := app.LoadPreferences(*dataDir)
+	if preferencesErr != nil {
+		log.Printf("load preferences: %v; using defaults", preferencesErr)
+	}
 
 	release, first, err := acquireSingleInstance()
 	if err != nil {
@@ -52,7 +56,7 @@ func main() {
 		return
 	}
 	log.Printf("Floe is ready at %s", url)
-	runPlatform(server, url, done, *noOpen)
+	runPlatform(server, url, done, *noOpen, preferences)
 }
 
 func initLogging(dataDir string) {

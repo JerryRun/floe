@@ -115,6 +115,7 @@
     <div class="editor-head">
 	  <span class="editor-title"><span id="editorDirty" class="editor-dirty hidden" title="有未保存的修改">●</span><strong id="editorTitle">文件</strong></span>
       <span class="dialog-head-actions">
+		<button id="editorPreviewToggle" class="editor-preview-toggle hidden" title="打开预览" aria-label="打开预览" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.4 12s3.5-6 9.6-6 9.6 6 9.6 6-3.5 6-9.6 6-9.6-6-9.6-6Zm9.6 3.4a3.4 3.4 0 1 0 0-6.8 3.4 3.4 0 0 0 0 6.8Zm0-1.8a1.6 1.6 0 1 1 0-3.2 1.6 1.6 0 0 1 0 3.2Z"/></svg><span>预览</span></button>
 		<button id="editorSearch" title="查找 (Ctrl+F)" aria-label="查找"><span class="material-symbols-rounded" aria-hidden="true">search</span></button>
         <select id="syntaxMode" title="语法高亮">
           <option value="auto">自动识别</option><option value="plain">纯文本</option>
@@ -138,7 +139,28 @@
 	  <button id="editorReplaceAll" class="hidden" title="全部替换">全部</button>
 	  <button id="editorFindClose" title="关闭查找" aria-label="关闭查找"><span class="material-symbols-rounded" aria-hidden="true">close</span></button>
 	</div>
-	<div class="editor-code"><pre id="editorLineNumbers" aria-hidden="true">1</pre><div class="editor-layers"><pre id="editorHighlight" aria-hidden="true"></pre><textarea id="editorContent" spellcheck="false" wrap="off"></textarea></div></div>
+	<div class="editor-workspace">
+	  <div class="editor-code"><pre id="editorLineNumbers" aria-hidden="true">1</pre><div class="editor-layers"><pre id="editorHighlight" aria-hidden="true"></pre><textarea id="editorContent" spellcheck="false" wrap="off"></textarea></div></div>
+	  <aside id="editorPreviewPane" class="editor-preview-pane">
+		<article id="editorPreview" class="editor-preview" aria-label="Markdown 预览"></article>
+		<section id="htmlPreview" class="html-preview hidden" aria-label="HTML 预览">
+		  <div class="html-preview-toolbar">
+			<button id="refreshHTMLPreview" title="刷新 HTML 预览" aria-label="刷新 HTML 预览"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button>
+			<select id="htmlViewportPreset" title="设备尺寸" aria-label="设备尺寸"><option value="responsive">自适应</option><option value="phone">手机</option><option value="tablet">平板</option><option value="desktop">桌面</option><option value="custom">自定义</option></select>
+			<label title="预览宽度"><input id="htmlViewportWidth" type="number" min="240" max="3840" value="1280" aria-label="预览宽度"><span>W</span></label>
+			<span class="html-size-cross">×</span>
+			<label title="预览高度"><input id="htmlViewportHeight" type="number" min="200" max="2160" value="720" aria-label="预览高度"><span>H</span></label>
+			<button id="rotateHTMLViewport" title="交换宽高" aria-label="交换宽高"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10l-3-3 1.4-1.4L20.8 8l-5.4 5.4L14 12l3-3H7V7Zm10 10H7l3 3-1.4 1.4L3.2 16l5.4-5.4L10 12l-3 3h10v2Z"/></svg></button>
+			<span id="htmlViewportScale" class="html-viewport-scale">100%</span>
+			<button id="focusHTMLPreview" title="预览全屏" aria-label="预览全屏" aria-pressed="false"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button>
+		  </div>
+		  <div id="htmlPreviewStage" class="html-preview-stage">
+			<div id="htmlPreviewFrame" class="html-preview-frame"><iframe id="htmlPreviewFrameContent" title="HTML 渲染结果" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe><span id="resizeHTMLViewport" class="html-viewport-resizer" title="拖动调整预览尺寸"></span></div>
+			<div id="htmlPreviewMessage" class="html-preview-message">正在准备预览…</div>
+		  </div>
+		</section>
+	  </aside>
+	</div>
 	<div class="editor-foot"><span class="editor-status"><button id="editorPosition" title="跳转到行 (Ctrl+G)">Ln 1, Col 1</button><span id="editorFormat">UTF-8 · LF</span><span id="editorState">未修改</span></span><button class="primary" id="saveEditor">保存</button></div>
   </dialog>
 
@@ -183,6 +205,8 @@
     <button data-terminal-placement="tab-down" role="menuitem"><span class="material-symbols-rounded rotate-split" aria-hidden="true">view_list</span><span>指定标签下方窗格</span></button>
   </div>
   <script src="/assets/hls.min.js" defer></script>
+  <script src="/assets/vendor/marked.min.js" defer></script>
+  <script src="/assets/vendor/purify.min.js" defer></script>
   <script src="/app.js" defer></script>
 </body>
 </html>

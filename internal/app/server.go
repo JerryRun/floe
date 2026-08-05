@@ -45,6 +45,8 @@ type Server struct {
 	httpServer      *http.Server
 	origin          string
 	monitorCancel   context.CancelFunc
+	htmlPreviewMu   sync.Mutex
+	htmlPreviews    map[string]htmlPreviewDocument
 }
 
 func New(dataDir string) (*Server, error) {
@@ -70,6 +72,7 @@ func New(dataDir string) (*Server, error) {
 		connectProvider: manager.Connect,
 		activity:        newActivityLog(dataDir),
 		askPassTokens:   make(map[string]askPassSecret),
+		htmlPreviews:    make(map[string]htmlPreviewDocument),
 	}
 	server.activity.Add("info", "system", "Floe Core 已启动", "")
 	return server, nil
@@ -250,6 +253,14 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		s.readContent(w, r)
 	case r.URL.Path == "/api/v1/files/content" && r.Method == http.MethodPut:
 		s.writeContent(w, r)
+	case r.URL.Path == "/api/v1/files/html-preview" && r.Method == http.MethodPost:
+		s.createHTMLPreview(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/v1/files/html-preview/") && r.Method == http.MethodGet:
+		s.serveHTMLPreview(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/v1/files/html-preview/") && r.Method == http.MethodDelete:
+		s.deleteHTMLPreview(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/v1/files/html-resource/") && r.Method == http.MethodGet:
+		s.serveHTMLPreviewResource(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/files/mkdir":
 		s.mkdir(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/files/create":

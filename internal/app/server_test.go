@@ -3,8 +3,44 @@ package app
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+func TestMarkdownPreviewAssetsBundled(t *testing.T) {
+	assets := map[string]string{
+		"web/assets/vendor/marked.min.js": "marked v15.0.12",
+		"web/assets/vendor/purify.min.js": "DOMPurify 3.2.6",
+	}
+	for file, marker := range assets {
+		data, err := webFiles.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read bundled asset %s: %v", file, err)
+		}
+		if !strings.Contains(string(data), marker) {
+			t.Errorf("bundled asset %s does not contain %q", file, marker)
+		}
+	}
+}
+
+func TestPreviewUIIsBundledAndSandboxed(t *testing.T) {
+	data, err := webFiles.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(data)
+	for _, marker := range []string{"editorPreviewToggle", "htmlViewportPreset", `sandbox="allow-scripts"`} {
+		if !strings.Contains(page, marker) {
+			t.Errorf("bundled preview UI does not contain %q", marker)
+		}
+	}
+	if strings.Contains(page, "visibility</span>") {
+		t.Fatal("preview button still relies on the missing visibility font ligature")
+	}
+	if strings.Contains(page, "allow-same-origin") {
+		t.Fatal("HTML preview iframe must not share the Floe origin")
+	}
+}
 
 func TestServerUsesFriendlyLocalhostURL(t *testing.T) {
 	url, err := friendlyLoopbackOrigin("127.0.0.1:47667")

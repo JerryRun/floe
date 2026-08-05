@@ -17,9 +17,9 @@ func acquireSingleInstance() (func(), bool, error) { return func() {}, true, nil
 func platformAlreadyRunning()                      {}
 func platformFatal(message string)                 { fmt.Fprintln(os.Stderr, message) }
 
-func runPlatform(server *app.Server, url string, done <-chan error, noOpen bool) {
+func runPlatform(server *app.Server, url string, done <-chan error, noOpen bool, preferences *app.Preferences) {
 	fmt.Printf("Floe is ready: %s\n", url)
-	if !noOpen {
+	if !noOpen && preferences.OpenBrowserOnStartup() {
 		if err := app.OpenBrowser(url); err != nil {
 			fmt.Fprintf(os.Stderr, "Could not open browser automatically: %v\n", err)
 		}

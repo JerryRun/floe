@@ -45,6 +45,7 @@ const (
 
 	mfString    = 0x00000000
 	mfGray      = 0x00000001
+	mfChecked   = 0x00000008
 	mfSeparator = 0x00000800
 
 	tpmRightButton  = 0x0002
@@ -52,10 +53,11 @@ const (
 	tdfUseHIconMain = 0x0002
 	tdcbfOKButton   = 0x0001
 
-	menuOpen       = 1001
-	menuPowerShell = 1002
-	menuAbout      = 1003
-	menuQuit       = 1004
+	menuOpen        = 1001
+	menuPowerShell  = 1002
+	menuAbout       = 1003
+	menuQuit        = 1004
+	menuOpenAtStart = 1005
 )
 
 var (
@@ -161,10 +163,11 @@ type taskDialogConfig struct {
 }
 
 type nativeTray struct {
-	window uintptr
-	icon   uintptr
-	server *app.Server
-	nid    notifyIconData
+	window      uintptr
+	icon        uintptr
+	server      *app.Server
+	preferences *app.Preferences
+	nid         notifyIconData
 }
 
 func acquireSingleInstance() (func(), bool, error) {
@@ -199,11 +202,11 @@ func messageBox(value string, style uint32) {
 	_, _ = windows.MessageBox(0, text, title, style)
 }
 
-func runPlatform(server *app.Server, initialURL string, done <-chan error, noOpen bool) {
+func runPlatform(server *app.Server, initialURL string, done <-chan error, noOpen bool, preferences *app.Preferences) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	tray, err := newNativeTray(server)
+	tray, err := newNativeTray(server, preferences)
 	if err != nil {
 		fail("Floe 托盘初始化失败", err)
 		return
@@ -211,7 +214,7 @@ func runPlatform(server *app.Server, initialURL string, done <-chan error, noOpe
 	defer tray.close()
 	activeTray = tray
 
-	if !noOpen {
+	if !noOpen && preferences.OpenBrowserOnStartup() {
 		go func() {
 			if err := app.OpenBrowser(initialURL); err != nil {
 				log.Printf("open browser: %v", err)
@@ -244,7 +247,7 @@ func runPlatform(server *app.Server, initialURL string, done <-chan error, noOpe
 	_ = server.Shutdown(ctx)
 }
 
-func newNativeTray(server *app.Server) (*nativeTray, error) {
+func newNativeTray(server *app.Server, preferences *app.Preferences) (*nativeTray, error) {
 	iconPath, err := writeTrayIcon()
 	if err != nil {
 		return nil, err
@@ -279,7 +282,7 @@ func newNativeTray(server *app.Server) (*nativeTray, error) {
 		_, _, _ = procDestroyIcon.Call(icon)
 		return nil, fmt.Errorf("create tray window: %w", createErr)
 	}
-	tray := &nativeTray{window: window, icon: icon, server: server}
+	tray := &nativeTray{window: window, icon: icon, server: server, preferences: preferences}
 	tray.nid = notifyIconData{
 		Size: uint32(unsafe.Sizeof(notifyIconData{})), Window: window, ID: 1,
 		Flags: nifMessage | nifIcon | nifTip | nifShowTip, Callback: wmAppTray, Icon: icon,
@@ -353,6 +356,11 @@ func (t *nativeTray) showMenu() {
 	appendMenu(menu, mfSeparator, 0, "")
 	appendMenu(menu, mfString, menuOpen, "打开 Floe")
 	appendMenu(menu, mfString, menuPowerShell, "打开 PowerShell")
+	startupFlags := uint32(mfString)
+	if t.preferences.OpenBrowserOnStartup() {
+		startupFlags |= mfChecked
+	}
+	appendMenu(menu, startupFlags, menuOpenAtStart, "启动时自动打开浏览器")
 	appendMenu(menu, mfSeparator, 0, "")
 	appendMenu(menu, mfString, menuAbout, "关于 Floe")
 	appendMenu(menu, mfSeparator, 0, "")
@@ -372,6 +380,12 @@ func (t *nativeTray) showMenu() {
 				platformFatal("无法打开 Windows Terminal。\n\n" + err.Error())
 			}
 		}()
+	case menuOpenAtStart:
+		next := !t.preferences.OpenBrowserOnStartup()
+		if err := t.preferences.SetOpenBrowserOnStartup(next); err != nil {
+			log.Printf("save preferences: %v", err)
+			platformFatal("无法保存启动设置。\n\n" + err.Error())
+		}
 	case menuAbout:
 		t.showAbout()
 	case menuQuit:

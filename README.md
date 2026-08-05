@@ -11,7 +11,9 @@ Floe 是一个由本地 Go Core 驱动的浏览器文件工作台。当前体验
 - 可调高度的任务区，按队列、成功和失败分类，支持暂停、恢复、删除和清空历史。
 - 内置实时操作日志，持久化连接、目录读取、传输和媒体播放错误的详细原因。
 - UTF-8 远程文本预览与编辑，支持语法高亮、行号、查找替换、行列跳转、未保存提示、
-  UTF-8 BOM 与 LF/CRLF 保持、窗口内全屏、冲突检测和原子保存。
+  UTF-8 BOM 与 LF/CRLF 保持、窗口内全屏、冲突检测和原子保存；Markdown 文件可打开
+  左侧源码、右侧渲染文档的实时分屏预览；HTML 文件支持实时页面渲染、设备尺寸调整
+  和右侧预览全屏。
 - 图片预览支持缩放、窗口内全屏和前后切换；列表与超大图标视图均支持图片缩略图。
 - MP4 直接播放；使用内置 hls.js 播放 M3U8/HLS，并代理同一 Provider 中的相对分片、子播放列表和密钥文件。
 - Windows 本地标签可从盘符目录树选择路径，并可创建多个本地标签。
@@ -20,6 +22,7 @@ Floe 是一个由本地 Go Core 驱动的浏览器文件工作台。当前体验
 - Core 已验证过主机指纹后，Windows OpenSSH 会以 `accept-new` 写入首次出现的主机密钥；已记录主机的密钥变化仍会被拒绝。
 - 同一 `Floe.exe` 通过 `floe ctl` 提供会话管理、目录、文本读取、日志以及本地/跨服务器并发校验传输，不要求浏览器 UI 正在运行。
 - 原生 Windows 托盘菜单和单实例保护，Windows 版不显示 CMD 窗口。
+- 托盘可配置启动时是否自动打开浏览器，设置保存在 `settings.json`。
 
 ## 从源码运行
 
@@ -59,7 +62,7 @@ Windows 版本使用 GUI 子系统，不会打开 CMD 窗口。关闭浏览器�
 
 启动后数据默认保存在 `%LOCALAPPDATA%\Floe`。会话保存在 `sessions.json`，
 加密密钥保存在 `session.key`，传输任务保存在 `tasks.json`，操作日志保存在
-`activity.json`（最多保留 1000 条）。
+`activity.json`（最多保留 1000 条），启动偏好保存在 `settings.json`。
 
 ## 命令行
 
@@ -116,3 +119,7 @@ Floe 源码使用 [Apache License 2.0](LICENSE) 发布。依赖与内嵌资源�
   `internal/app/web/assets/vendor/HLS.js-LICENSE.txt`。
 - Google Material Symbols，Apache-2.0。许可证见
   `internal/app/web/assets/material-symbols-LICENSE.txt`。
+- marked 15.0.12，MIT。许可证见
+  `internal/app/web/assets/vendor/MARKED-LICENSE.md`。
+- DOMPurify 3.2.6，Apache-2.0 或 MPL-2.0。许可证见
+  `internal/app/web/assets/vendor/DOMPURIFY-LICENSE.txt`。

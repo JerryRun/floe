@@ -14,12 +14,18 @@ license terms are retained.
 | [hashicorp/errwrap](https://github.com/hashicorp/errwrap) | 1.0.0 | MPL-2.0 |
 | [kr/fs](https://github.com/kr/fs) | 0.1.0 | BSD-3-Clause |
 | [hls.js](https://github.com/video-dev/hls.js) | 1.6.13 | Apache-2.0 |
+| [marked](https://github.com/markedjs/marked) | 15.0.12 | MIT |
+| [DOMPurify](https://github.com/cure53/DOMPurify) | 3.2.6 | Apache-2.0 OR MPL-2.0 |
 | [Google Material Symbols](https://fonts.google.com/icons) | bundled font | Apache-2.0 |
 
 The bundled hls.js license is available at
 [`internal/app/web/assets/vendor/HLS.js-LICENSE.txt`](internal/app/web/assets/vendor/HLS.js-LICENSE.txt).
 The bundled Material Symbols license is available at
 [`internal/app/web/assets/material-symbols-LICENSE.txt`](internal/app/web/assets/material-symbols-LICENSE.txt).
+The bundled marked and DOMPurify licenses are available at
+[`internal/app/web/assets/vendor/MARKED-LICENSE.md`](internal/app/web/assets/vendor/MARKED-LICENSE.md)
+and
+[`internal/app/web/assets/vendor/DOMPURIFY-LICENSE.txt`](internal/app/web/assets/vendor/DOMPURIFY-LICENSE.txt).
 
 This notice is informational and does not replace the complete license text of
 each dependency. Binary releases should ship this file together with the Floe

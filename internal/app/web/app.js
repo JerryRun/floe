@@ -29,6 +29,7 @@ const DND_TAB = "application/x-floe-tab";
 const BOOKMARKS_STORAGE = "floe.bookmarks.v1";
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+let editorPreviewTimer = 0;
 
 async function api(url, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -279,6 +280,8 @@ async function openSession(side, providerID, path = "") {
   if (!tab) {
     tab = { provider: providerID, path: initialPath };
     panel.tabs.push(tab);
+  } else if (path) {
+    tab.path = initialPath;
   } else if (justConnected && !path && provider?.kind === "sftp") {
     tab.path = initialPath;
   }
@@ -333,6 +336,10 @@ function renderTabs(side) {
       panel.active = tab.provider; setActivePane(side); renderTabs(side); saveWorkspace(); loadPanel(side);
     });
     $(".tab-close", node)?.addEventListener("click", (event) => { event.stopPropagation(); closeTab(side, tab.provider); });
+    node.addEventListener("contextmenu", (event) => {
+      event.preventDefault(); event.stopPropagation();
+      showTabMenu(event, side, tab.provider);
+    });
     node.addEventListener("dragstart", (event) => {
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData(DND_TAB, JSON.stringify({ side, provider: tab.provider }));
@@ -354,6 +361,36 @@ function closeTab(side, providerID) {
   const index = panel.tabs.findIndex((tab) => tab.provider === providerID);
   panel.tabs.splice(index, 1);
   if (panel.active === providerID) panel.active = panel.tabs[Math.max(0, index - 1)].provider;
+  renderTabs(side); saveWorkspace(); loadPanel(side); renderSessionTree();
+}
+
+function primaryLocalProvider() {
+  return providerByID("local") || state.providers.find((provider) => provider.kind === "local");
+}
+
+function showTabMenu(event, side, providerID) {
+  const panel = state.panels[side];
+  const provider = providerByID(providerID);
+  const pinned = side === "left" && provider?.id === "local";
+  const local = primaryLocalProvider();
+  const onlyPrimaryLocal = panel.tabs.length === 1 && panel.tabs[0].provider === local?.id;
+  showContextMenu(event.clientX, event.clientY, [
+    { label: "关闭标签", disabled: pinned || panel.tabs.length <= 1, action: () => closeTab(side, providerID) },
+    { label: "关闭全部标签", disabled: onlyPrimaryLocal || (!local && panel.tabs.length <= 1), action: () => closeAllTabs(side) },
+  ]);
+}
+
+function closeAllTabs(side) {
+  const panel = state.panels[side];
+  const local = primaryLocalProvider();
+  let fallback = local && panel.tabs.find((tab) => tab.provider === local.id);
+  if (!fallback && local) fallback = { provider: local.id, path: "/" };
+  if (!fallback) fallback = currentTab(side);
+  if (!fallback) return;
+  panel.tabs = [fallback];
+  panel.active = fallback.provider;
+  panel.selection.clear();
+  panel.selectionAnchor = -1;
   renderTabs(side); saveWorkspace(); loadPanel(side); renderSessionTree();
 }
 
@@ -756,6 +793,7 @@ function showContextMenu(x, y, items) {
     const button = document.createElement("button");
     button.textContent = item.label;
     if (item.danger) button.className = "danger";
+    button.disabled = Boolean(item.disabled);
     button.addEventListener("click", () => { hideContextMenu(); item.action(); });
     menu.append(button);
   }
@@ -820,12 +858,18 @@ function bindDrops(side) {
 function hasType(event, type) { return [...event.dataTransfer.types].includes(type); }
 function clearDropTargets() { $$(".drop-target").forEach((node) => node.classList.remove("drop-target")); }
 
-async function openEditor(side, entry) {
+async function openEditor(side, entry, providerID = "") {
 	if (state.editor?.saving) { toast("文件正在保存，请稍候"); return; }
   if (state.editor?.dirty && !confirm("当前文件有未保存的修改，确定放弃并打开其他文件？")) return;
   const tab = currentTab(side);
+  providerID = providerID || tab?.provider || "";
+  if (!providerID) return;
+  releaseHTMLPreview(state.editor);
   state.editor = null;
+  clearTimeout(editorPreviewTimer);
   closeEditorFind();
+  const previewKind = isMarkdownPath(entry.path) ? "markdown" : (isHTMLPath(entry.path) ? "html" : "");
+  setDocumentPreview(false, previewKind);
   $("#editorTitle").textContent = entry.path;
 	$("#editorTitle").title = entry.path;
 	$("#editorDirty").classList.add("hidden");
@@ -838,12 +882,14 @@ async function openEditor(side, entry) {
   $("#saveEditor").disabled = true;
   if (!$("#editorDialog").open) $("#editorDialog").showModal();
   try {
-    const result = await api(`/api/v1/files/content?provider=${encodeURIComponent(tab.provider)}&path=${encodeURIComponent(entry.path)}`);
+    const result = await api(`/api/v1/files/content?provider=${encodeURIComponent(providerID)}&path=${encodeURIComponent(entry.path)}`);
     state.editor = {
-	  provider: tab.provider, path: entry.path, etag: result.etag, side, language: syntaxForPath(entry.path),
+	  provider: providerID, path: entry.path, etag: result.etag, side, language: syntaxForPath(entry.path),
 	  originalContent: result.content, dirty: false, saving: false, encoding: result.encoding || "utf-8",
 	  bom: Boolean(result.bom), newline: result.newline || "lf", mixedNewlines: Boolean(result.mixed_newlines),
 	  size: result.size ?? new TextEncoder().encode(result.content).length, lineCount: 0, matchCase: false,
+	  previewKind, previewOpen: false, previewFocus: false, htmlPreviewToken: "", htmlPreviewSequence: 0,
+	  htmlViewportMode: "responsive", htmlViewportWidth: 1280, htmlViewportHeight: 720, htmlViewportScale: 1,
 	};
     $("#editorTitle").textContent = entry.path;
 	$("#editorTitle").title = entry.path;
@@ -852,9 +898,278 @@ async function openEditor(side, entry) {
 	refreshEditorDisplay();
     $("#editorContent").focus();
   } catch (error) {
+    setDocumentPreview(false, "");
     $("#editorState").textContent = `读取失败：${error.message}`;
     toast(error.message, "error");
   }
+}
+
+function isMarkdownPath(filePath) {
+  return ["md", "markdown"].includes(fileExtension(filePath));
+}
+
+function isHTMLPath(filePath) {
+  return ["html", "htm"].includes(fileExtension(filePath));
+}
+
+function setDocumentPreview(open, kind = state.editor?.previewKind || "") {
+  open = Boolean(open && kind);
+  if (state.editor) state.editor.previewOpen = open;
+  const dialog = $("#editorDialog"), button = $("#editorPreviewToggle");
+  if (!open) {
+    clearTimeout(editorPreviewTimer);
+    if (state.editor) state.editor.previewFocus = false;
+    dialog.classList.remove("preview-focus");
+    releaseHTMLPreview(state.editor);
+  }
+  dialog.classList.toggle("preview-open", open);
+  button.classList.toggle("hidden", !kind);
+  button.classList.toggle("active", open);
+  button.setAttribute("aria-pressed", String(open));
+  const label = kind === "html" ? "HTML" : "Markdown";
+  button.setAttribute("aria-label", open ? `关闭 ${label} 预览` : `打开 ${label} 预览`);
+  button.title = open ? `关闭 ${label} 预览` : `打开 ${label} 预览`;
+  $("#editorPreview").classList.toggle("hidden", kind !== "markdown");
+  $("#htmlPreview").classList.toggle("hidden", kind !== "html");
+  if (!open) {
+    $("#editorPreview").replaceChildren();
+    $("#htmlPreviewFrameContent").src = "about:blank";
+    return;
+  }
+  if (kind === "markdown") renderMarkdownPreview();
+  if (kind === "html") {
+    updateHTMLViewportControls();
+    requestAnimationFrame(() => { fitHTMLViewport(); renderHTMLPreview(); });
+  }
+}
+
+function queueDocumentPreview() {
+  if (!state.editor?.previewOpen) return;
+  clearTimeout(editorPreviewTimer);
+  const render = state.editor.previewKind === "html" ? renderHTMLPreview : renderMarkdownPreview;
+  editorPreviewTimer = setTimeout(render, state.editor.previewKind === "html" ? 300 : 150);
+}
+
+function normalizedMarkdownPath(documentPath, resource) {
+  let value = resource.split(/[?#]/, 1)[0];
+  try { value = decodeURIComponent(value); } catch (_) {}
+  value = value.replaceAll("\\", "/");
+  const base = value.startsWith("/") ? value : `${parentPath(documentPath)}/${value}`;
+  const parts = [];
+  for (const part of base.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") parts.pop();
+    else parts.push(part);
+  }
+  return `/${parts.join("/")}`;
+}
+
+function localMarkdownResource(value) {
+  return value && !value.startsWith("#") && !value.startsWith("//") && !/^[a-z][a-z\d+.-]*:/i.test(value);
+}
+
+function renderMarkdownPreview() {
+  if (state.editor?.previewKind !== "markdown" || !state.editor.previewOpen) return;
+  const preview = $("#editorPreview"), source = $("#editorContent").value;
+  preview.replaceChildren();
+  if (!source.trim()) {
+    const empty = document.createElement("div");
+    empty.className = "markdown-preview-empty";
+    empty.textContent = "文档为空，左侧输入内容后将在这里显示预览。";
+    preview.append(empty);
+    return;
+  }
+  try {
+    if (!window.marked?.parse || !window.DOMPurify?.sanitize) throw new Error("Markdown 渲染组件未加载");
+    const documentNode = document.createElement("div");
+    documentNode.className = "markdown-document";
+    const rendered = window.marked.parse(source, { gfm: true, breaks: false });
+    documentNode.innerHTML = window.DOMPurify.sanitize(rendered, {
+      USE_PROFILES: { html: true }, FORBID_TAGS: ["form", "iframe", "object", "embed"], FORBID_ATTR: ["style"],
+    });
+    for (const image of $$("img[src]", documentNode)) {
+      const value = image.getAttribute("src");
+      if (!localMarkdownResource(value)) continue;
+      const path = normalizedMarkdownPath(state.editor.path, value);
+      image.src = `/api/v1/files/raw?provider=${encodeURIComponent(state.editor.provider)}&path=${encodeURIComponent(path)}`;
+      image.loading = "lazy";
+      image.decoding = "async";
+    }
+    for (const link of $$("a[href]", documentNode)) {
+      const value = link.getAttribute("href");
+      if (/^https?:/i.test(value)) {
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+      } else if (localMarkdownResource(value)) {
+        link.dataset.markdownPath = normalizedMarkdownPath(state.editor.path, value);
+        link.href = "#";
+      }
+    }
+    preview.append(documentNode);
+  } catch (error) {
+    const message = document.createElement("div");
+    message.className = "markdown-preview-error";
+    message.textContent = `Markdown 预览失败：${error.message}`;
+    preview.append(message);
+  }
+}
+
+function openMarkdownPreviewLink(event) {
+  const link = event.target.closest("a[data-markdown-path]");
+  if (!link || !state.editor) return;
+  event.preventDefault();
+  const active = state.editor;
+  openEditor(active.side, { path: link.dataset.markdownPath }, active.provider);
+}
+
+async function renderHTMLPreview() {
+  const active = state.editor;
+  if (active?.previewKind !== "html" || !active.previewOpen) return;
+  const sequence = ++active.htmlPreviewSequence;
+  const message = $("#htmlPreviewMessage");
+  message.textContent = "正在渲染 HTML…";
+  message.classList.remove("hidden");
+  try {
+    const result = await api("/api/v1/files/html-preview", {
+      method: "POST",
+      body: JSON.stringify({
+        provider: active.provider, path: active.path, content: $("#editorContent").value,
+        token: active.htmlPreviewToken,
+      }),
+    });
+    if (state.editor !== active || sequence !== active.htmlPreviewSequence || !active.previewOpen) return;
+    active.htmlPreviewToken = result.token;
+    $("#htmlPreviewFrameContent").src = `${result.url}?render=${sequence}`;
+  } catch (error) {
+    if (state.editor !== active || sequence !== active.htmlPreviewSequence) return;
+    message.textContent = `HTML 预览失败：${error.message}`;
+    message.classList.remove("hidden");
+  }
+}
+
+function releaseHTMLPreview(editor) {
+  const token = editor?.htmlPreviewToken;
+  if (!token) return;
+  editor.htmlPreviewToken = "";
+  fetch(`/api/v1/files/html-preview/${encodeURIComponent(token)}`, { method: "DELETE", keepalive: true }).catch(() => {});
+}
+
+const htmlViewportPresets = {
+  phone: [375, 812], tablet: [768, 1024], desktop: [1280, 720],
+};
+
+function setHTMLViewportPreset(mode) {
+  if (state.editor?.previewKind !== "html") return;
+  state.editor.htmlViewportMode = mode;
+  if (htmlViewportPresets[mode]) {
+    [state.editor.htmlViewportWidth, state.editor.htmlViewportHeight] = htmlViewportPresets[mode];
+  }
+  updateHTMLViewportControls();
+  requestAnimationFrame(fitHTMLViewport);
+}
+
+function updateHTMLViewportControls() {
+  if (state.editor?.previewKind !== "html") return;
+  const responsive = state.editor.htmlViewportMode === "responsive";
+  $("#htmlViewportPreset").value = state.editor.htmlViewportMode;
+  $("#htmlViewportWidth").disabled = responsive;
+  $("#htmlViewportHeight").disabled = responsive;
+  if (!responsive) {
+    $("#htmlViewportWidth").value = state.editor.htmlViewportWidth;
+    $("#htmlViewportHeight").value = state.editor.htmlViewportHeight;
+  }
+  $("#htmlPreview").classList.toggle("responsive", responsive);
+}
+
+function fitHTMLViewport() {
+  if (state.editor?.previewKind !== "html" || !state.editor.previewOpen) return;
+  const stage = $("#htmlPreviewStage"), frame = $("#htmlPreviewFrame"), iframe = $("#htmlPreviewFrameContent");
+  const availableWidth = Math.max(1, stage.clientWidth - 24), availableHeight = Math.max(1, stage.clientHeight - 24);
+  if (state.editor.htmlViewportMode === "responsive") {
+    frame.style.width = `${availableWidth}px`;
+    frame.style.height = `${availableHeight}px`;
+    iframe.style.width = `${availableWidth}px`;
+    iframe.style.height = `${availableHeight}px`;
+    iframe.style.transform = "none";
+    $("#htmlViewportWidth").value = Math.round(availableWidth);
+    $("#htmlViewportHeight").value = Math.round(availableHeight);
+    $("#htmlViewportScale").textContent = "自适应";
+    state.editor.htmlViewportScale = 1;
+    return;
+  }
+  const width = state.editor.htmlViewportWidth, height = state.editor.htmlViewportHeight;
+  const scale = Math.min(1, availableWidth / width, availableHeight / height);
+  state.editor.htmlViewportScale = scale;
+  frame.style.width = `${Math.max(1, width * scale)}px`;
+  frame.style.height = `${Math.max(1, height * scale)}px`;
+  iframe.style.width = `${width}px`;
+  iframe.style.height = `${height}px`;
+  iframe.style.transform = `scale(${scale})`;
+  $("#htmlViewportScale").textContent = `${Math.round(scale * 100)}%`;
+}
+
+function applyCustomHTMLViewport() {
+  if (state.editor?.previewKind !== "html") return;
+  const width = Math.min(3840, Math.max(240, Number($("#htmlViewportWidth").value) || 240));
+  const height = Math.min(2160, Math.max(200, Number($("#htmlViewportHeight").value) || 200));
+  state.editor.htmlViewportMode = "custom";
+  state.editor.htmlViewportWidth = width;
+  state.editor.htmlViewportHeight = height;
+  updateHTMLViewportControls();
+  fitHTMLViewport();
+}
+
+function rotateHTMLViewport() {
+  if (state.editor?.previewKind !== "html") return;
+  if (state.editor.htmlViewportMode === "responsive") {
+    state.editor.htmlViewportMode = "custom";
+    state.editor.htmlViewportWidth = Number($("#htmlViewportHeight").value) || 720;
+    state.editor.htmlViewportHeight = Number($("#htmlViewportWidth").value) || 1280;
+  } else {
+    [state.editor.htmlViewportWidth, state.editor.htmlViewportHeight] = [state.editor.htmlViewportHeight, state.editor.htmlViewportWidth];
+    state.editor.htmlViewportMode = "custom";
+  }
+  updateHTMLViewportControls();
+  fitHTMLViewport();
+}
+
+function toggleHTMLPreviewFocus(force) {
+  if (state.editor?.previewKind !== "html" || !state.editor.previewOpen) return;
+  const next = force ?? !state.editor.previewFocus;
+  state.editor.previewFocus = next;
+  $("#editorDialog").classList.toggle("preview-focus", next);
+  $("#focusHTMLPreview").classList.toggle("active", next);
+  $("#focusHTMLPreview").setAttribute("aria-pressed", String(next));
+  $("#focusHTMLPreview").title = next ? "退出预览全屏" : "预览全屏";
+  requestAnimationFrame(fitHTMLViewport);
+}
+
+function initializeHTMLViewportResize() {
+  const handle = $("#resizeHTMLViewport");
+  let start = null;
+  handle.addEventListener("pointerdown", (event) => {
+    if (state.editor?.previewKind !== "html") return;
+    event.preventDefault();
+    start = {
+      x: event.clientX, y: event.clientY,
+      width: state.editor.htmlViewportWidth, height: state.editor.htmlViewportHeight,
+      scale: state.editor.htmlViewportScale || 1,
+    };
+    handle.setPointerCapture(event.pointerId);
+  });
+  handle.addEventListener("pointermove", (event) => {
+    if (!start || !handle.hasPointerCapture(event.pointerId) || !state.editor) return;
+    state.editor.htmlViewportMode = "custom";
+    state.editor.htmlViewportWidth = Math.min(3840, Math.max(240, Math.round(start.width + (event.clientX - start.x) / start.scale)));
+    state.editor.htmlViewportHeight = Math.min(2160, Math.max(200, Math.round(start.height + (event.clientY - start.y) / start.scale)));
+    updateHTMLViewportControls();
+    fitHTMLViewport();
+  });
+  handle.addEventListener("pointerup", (event) => {
+    if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+    start = null;
+  });
+  new ResizeObserver(() => fitHTMLViewport()).observe($("#htmlPreviewStage"));
 }
 
 function syntaxForPath(filePath) {
@@ -943,6 +1258,7 @@ function editorChanged() {
 	if (!state.editor) return;
 	state.editor.dirty = $("#editorContent").value !== state.editor.originalContent;
 	refreshEditorDisplay();
+	queueDocumentPreview();
 }
 
 function highlightSource(text, language) {
@@ -1079,6 +1395,8 @@ function jumpToEditorLine() {
 function requestCloseEditor() {
 	if (state.editor?.saving) { toast("文件正在保存，请稍候"); return; }
 	if (state.editor?.dirty && !confirm("文件尚未保存，确定不保存并关闭？")) return;
+	clearTimeout(editorPreviewTimer);
+	setDocumentPreview(false, "");
 	state.editor = null;
 	$("#editorDialog").close();
 }
@@ -1114,6 +1432,7 @@ function toggleDialogMaximized(dialog, button) {
   button.innerHTML = '<span class="material-symbols-rounded" aria-hidden="true">fullscreen</span>';
   button.title = maximized ? "还原窗口" : "窗口内全屏";
   if (dialog === $("#imageDialog") && state.image) requestAnimationFrame(fitImage);
+  if (dialog === $("#editorDialog") && state.editor?.previewKind === "html") requestAnimationFrame(fitHTMLViewport);
 }
 
 function openImage(side, entry) {
@@ -1581,12 +1900,13 @@ function createTreeNode(directory, depth, drive = false) {
 
 function hideLocalTree() { $("#localTreePopup").classList.remove("open"); }
 
-async function createLocalTab(side, root) {
+async function createLocalTab(side, root, initialPath = "") {
   if (!root) { toast("没有可用的本地目录", "error"); return; }
   try {
     const provider = await api("/api/v1/local/tabs", { method: "POST", body: JSON.stringify({ path: root }) });
     await loadProviders();
-    await openSession(side, provider.id);
+    const providerPath = initialPath ? localProviderPath(provider, initialPath) : "/";
+    await openSession(side, provider.id, providerPath || "/");
   } catch (error) { toast(error.message, "error"); }
 }
 
@@ -1614,6 +1934,28 @@ function localProviderPath(provider, value) {
   if (!normalizedRoot || (normalizedValue !== normalizedRoot && !normalizedValue.startsWith(`${normalizedRoot}\\`))) return null;
   const relative = value.slice(root.length).replaceAll("\\", "/").replace(/^\/+/, "");
   return relative ? `/${relative}` : "/";
+}
+
+function localBookmarkRoot(value) {
+  const windowsPath = value.replaceAll("/", "\\");
+  const drive = windowsPath.match(/^([A-Za-z]:)\\/);
+  if (drive) return `${drive[1]}\\`;
+  const share = windowsPath.match(/^\\\\([^\\]+)\\([^\\]+)(?:\\|$)/);
+  if (share) return `\\\\${share[1]}\\${share[2]}\\`;
+  return "/";
+}
+
+async function openLocalBookmark(side, value) {
+  const candidates = state.providers
+    .filter((provider) => provider.kind === "local")
+    .map((provider) => ({ provider, path: localProviderPath(provider, value) }))
+    .filter((candidate) => candidate.path && candidate.path !== "/")
+    .sort((left, right) => (right.provider.location || "").length - (left.provider.location || "").length);
+  if (candidates.length) {
+    await openSession(side, candidates[0].provider.id, candidates[0].path);
+    return;
+  }
+  await createLocalTab(side, localBookmarkRoot(value), value);
 }
 
 function legacyBookmarkStore() {
@@ -1765,7 +2107,7 @@ function showBookmarkMenu(side, anchor) {
         hideBookmarkMenu();
         const active = currentTab(side);
         if (!active || active.provider !== tab.provider) return;
-        if (provider?.kind === "local") navigatePathInput(side, entry.path);
+        if (provider?.kind === "local") openLocalBookmark(side, entry.path);
         else { active.path = entry.path; loadPanel(side); }
       });
       return button;
@@ -1942,8 +2284,9 @@ function initializeQueueResize() {
 async function main() {
   try {
     await loadProviders(false); await loadBookmarks(); initializeWorkspace(); renderSessionTree();
-    bindPanel("left"); bindPanel("right"); renderTabs("left"); renderTabs("right");
-    initializeQueueResize();
+	    bindPanel("left"); bindPanel("right"); renderTabs("left"); renderTabs("right");
+	    initializeQueueResize();
+	    initializeHTMLViewportResize();
 	await loadPanel("left");
 	await loadPanel("right");
 	await Promise.all([api("/api/v1/transfers").then(refreshTasks), api("/api/v1/logs").then(refreshLogs)]);
@@ -1971,6 +2314,15 @@ $("#sessionSearch").addEventListener("input", renderSessionTree);
 $("#swapPanes").addEventListener("click", swapPanels);
 $("#closeEditor").addEventListener("click", requestCloseEditor);
 $("#maximizeEditor").addEventListener("click", () => toggleDialogMaximized($("#editorDialog"), $("#maximizeEditor")));
+$("#editorPreviewToggle").addEventListener("click", () => setDocumentPreview(!state.editor?.previewOpen));
+$("#editorPreview").addEventListener("click", openMarkdownPreviewLink);
+$("#refreshHTMLPreview").addEventListener("click", renderHTMLPreview);
+$("#htmlViewportPreset").addEventListener("change", (event) => setHTMLViewportPreset(event.target.value));
+$("#htmlViewportWidth").addEventListener("change", applyCustomHTMLViewport);
+$("#htmlViewportHeight").addEventListener("change", applyCustomHTMLViewport);
+$("#rotateHTMLViewport").addEventListener("click", rotateHTMLViewport);
+$("#focusHTMLPreview").addEventListener("click", () => toggleHTMLPreviewFocus());
+$("#htmlPreviewFrameContent").addEventListener("load", () => $("#htmlPreviewMessage").classList.add("hidden"));
 $("#saveEditor").addEventListener("click", saveEditor);
 $("#editorSearch").addEventListener("click", () => showEditorFind(false));
 $("#editorFindClose").addEventListener("click", closeEditorFind);
@@ -2003,7 +2355,11 @@ $("#editorContent").addEventListener("keydown", (event) => {
 	else if (event.key === "Escape" && !$("#editorFindBar").classList.contains("hidden")) { event.preventDefault(); closeEditorFind(); }
 });
 $("#editorPosition").addEventListener("click", jumpToEditorLine);
-$("#editorDialog").addEventListener("cancel", (event) => { event.preventDefault(); requestCloseEditor(); });
+$("#editorDialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  if (state.editor?.previewFocus) toggleHTMLPreviewFocus(false);
+  else requestCloseEditor();
+});
 $("#syntaxMode").addEventListener("change", refreshEditorHighlight);
 $("#queueToggle").addEventListener("click", () => $("#transferQueue").classList.toggle("collapsed"));
 $$('.task-tab').forEach((tab) => tab.addEventListener("click", () => { state.taskFilter = tab.dataset.taskFilter; $("#transferQueue").classList.remove("collapsed"); renderTaskList(); }));
