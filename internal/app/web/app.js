@@ -15,8 +15,8 @@ const state = {
   bookmarkSide: "",
   terminalProvider: "",
   panels: {
-    left: { tabs: [], active: "", entries: [], selection: new Set(), selectionAnchor: -1, view: "list", sort: { field: "name", direction: "asc" }, renderQueued: false },
-    right: { tabs: [], active: "", entries: [], selection: new Set(), selectionAnchor: -1, view: "list", sort: { field: "name", direction: "asc" }, renderQueued: false },
+    left: { tabs: [], active: "", entries: [], selection: new Set(), selectionAnchor: -1, view: "list", sort: { field: "name", direction: "asc" }, renderQueued: false, loadID: 0 },
+    right: { tabs: [], active: "", entries: [], selection: new Set(), selectionAnchor: -1, view: "list", sort: { field: "name", direction: "asc" }, renderQueued: false, loadID: 0 },
   },
   editor: null,
   image: null,
@@ -412,18 +412,20 @@ function moveTab(fromSide, toSide, providerID) {
 
 async function loadPanel(side, allowReconnect = true) {
   const panel = state.panels[side];
+  const loadID = ++panel.loadID;
   const tab = currentTab(side);
   const el = panelElements(side);
   if (!tab) return;
   const provider = providerByID(tab.provider);
   if (provider && provider.kind !== "local" && !provider.connected) {
-	if (allowReconnect) {
-	  el.canvas.innerHTML = '<div class="empty-files">正在连接…</div>';
-	  const connected = await connectSavedSession(tab.provider);
-	  await loadProviders();
-	  renderTabs("left"); renderTabs("right");
-	  if (connected) return loadPanel(side, false);
-	}
+    if (allowReconnect) {
+      setPanelLoading(el, "正在连接…");
+      await nextFrame();
+      const connected = await connectSavedSession(tab.provider);
+      await loadProviders();
+      renderTabs("left"); renderTabs("right");
+      if (connected) return loadPanel(side, false);
+    }
     panel.entries = [];
     panel.selection.clear();
     panel.selectionAnchor = -1;
@@ -437,12 +439,22 @@ async function loadPanel(side, allowReconnect = true) {
   }
   el.path.value = tab.path;
   updateBookmarkControl(side);
-  el.canvas.innerHTML = '<div class="empty-files">正在读取…</div>';
+  setPanelLoading(el, "正在读取目录…");
+  // Let the browser paint the loading state before a slow local/remote
+  // directory request (or a large JSON response) occupies the UI thread.
+  await nextFrame();
   try {
     const result = await api(`/api/v1/files?provider=${encodeURIComponent(tab.provider)}&path=${encodeURIComponent(tab.path)}`);
+    if (loadID !== panel.loadID) return;
     tab.path = result.path;
     tab.displayPath = result.display_path || result.path;
-    panel.entries = sortEntries(result.entries || [], panel.sort);
+    const entries = result.entries || [];
+    if (entries.length > 500) {
+      setPanelLoading(el, `正在整理 ${entries.length.toLocaleString()} 项…`);
+      await nextFrame();
+      if (loadID !== panel.loadID) return;
+    }
+    panel.entries = sortEntries(entries, panel.sort);
     panel.selection.clear();
     panel.selectionAnchor = -1;
     el.path.value = tab.displayPath;
@@ -459,15 +471,16 @@ async function loadPanel(side, allowReconnect = true) {
     renderPanel(side);
     saveWorkspace();
   } catch (error) {
-	if (allowReconnect && error.payload?.code === "CONNECTION_LOST" && provider?.kind !== "local") {
-	  el.canvas.innerHTML = '<div class="empty-files">连接已断开，正在重新连接…</div>';
-	  const reconnected = await connectSavedSession(tab.provider);
-	  await loadProviders();
-	  renderTabs("left"); renderTabs("right");
-	  if (reconnected) {
-		return loadPanel(side, false);
-	  }
-	}
+    if (loadID !== panel.loadID) return;
+    if (allowReconnect && error.payload?.code === "CONNECTION_LOST" && provider?.kind !== "local") {
+      el.canvas.innerHTML = '<div class="empty-files">连接已断开，正在重新连接…</div>';
+      const reconnected = await connectSavedSession(tab.provider);
+      await loadProviders();
+      renderTabs("left"); renderTabs("right");
+      if (reconnected) {
+        return loadPanel(side, false);
+      }
+    }
     el.canvas.innerHTML = `<div class="empty-files">${escapeHTML(error.message)}</div>`;
     toast(error.message, "error");
   }
@@ -484,6 +497,37 @@ function sortEntries(entries, sort) {
     if (!comparison && sort.field !== "name") comparison = a.name.localeCompare(b.name, "zh-CN", { numeric: true, sensitivity: "base" });
     return comparison * multiplier;
   });
+}
+
+function nextFrame() {
+  return new Promise((resolve) => requestAnimationFrame(resolve));
+}
+
+function setPanelLoading(el, message) {
+  el.canvas.innerHTML = `<div class="empty-files loading"><span class="loading-spinner" aria-hidden="true"></span>${escapeHTML(message)}</div>`;
+  el.count.textContent = "正在读取…";
+}
+
+function locateEntryByKey(side, key) {
+  if (!/^[a-z]$/i.test(key)) return false;
+  const panel = state.panels[side];
+  if (!panel.entries.length) return false;
+  const needle = key.toLocaleLowerCase();
+  const start = panel.selectionAnchor >= 0 ? panel.selectionAnchor + 1 : 0;
+  let index = panel.entries.findIndex((entry, offset) => offset >= start && entry.name.toLocaleLowerCase().startsWith(needle));
+  if (index < 0) index = panel.entries.findIndex((entry) => entry.name.toLocaleLowerCase().startsWith(needle));
+  if (index < 0) return false;
+  selectEntry(side, index);
+  const viewport = panelElements(side).viewport;
+  const list = panel.view === "list";
+  const cellHeight = list ? 29 : 138;
+  const columns = list ? 1 : Math.max(1, Math.floor(viewport.clientWidth / 152));
+  const row = Math.floor(index / columns);
+  const top = row * cellHeight;
+  const bottom = top + cellHeight;
+  if (top < viewport.scrollTop) viewport.scrollTop = top;
+  else if (bottom > viewport.scrollTop + viewport.clientHeight) viewport.scrollTop = bottom - viewport.clientHeight;
+  return true;
 }
 
 function updateSortHeaders(side) {
@@ -663,19 +707,19 @@ async function transferEntries(fromSide, toSide, entries) {
       method: "POST",
       body: JSON.stringify({ source_provider: source.provider, source_path: entry.path, target_provider: target.provider, target_path: joinPath(target.path, entry.name), concurrency: 4 }),
     })));
-  const succeeded = results.filter((result) => result.status === "fulfilled").length;
-  const failed = results.length - succeeded;
-  if (succeeded) {
-    $("#transferQueue").classList.remove("collapsed");
-    state.taskFilter = "queue";
-    renderTaskList();
-  }
-  if (failed) {
-    const firstError = results.find((result) => result.status === "rejected")?.reason?.message;
-    toast(succeeded ? `已开始传输 ${succeeded} 项，${failed} 项失败` : firstError || "传输失败", "error");
-  } else {
-    toast(succeeded === 1 ? `开始传输 ${transferable[0].name}` : `已开始传输 ${succeeded} 项`);
-  }
+    const succeeded = results.filter((result) => result.status === "fulfilled").length;
+    const failed = results.length - succeeded;
+    if (succeeded) {
+      $("#transferQueue").classList.remove("collapsed");
+      state.taskFilter = "queue";
+      renderTaskList();
+    }
+    if (failed) {
+      const firstError = results.find((result) => result.status === "rejected")?.reason?.message;
+      toast(succeeded ? `已开始传输 ${succeeded} 项，${failed} 项失败` : firstError || "传输失败", "error");
+    } else {
+      toast(succeeded === 1 ? `开始传输 ${transferable[0].name}` : `已开始传输 ${succeeded} 项`);
+    }
 }
 
 async function deleteEntry(side, entry) {
@@ -1696,7 +1740,6 @@ async function deleteTask(id) {
 
 async function clearTaskHistory() {
 	if (state.taskFilter === "logs") {
-		if (!confirm("确定清空全部操作日志？")) return;
 		try {
 			const result = await api("/api/v1/logs", { method: "DELETE" });
 			toast(`已清空 ${result.removed} 条日志`);
@@ -1706,7 +1749,6 @@ async function clearTaskHistory() {
   const status = state.taskFilter === "success" ? "completed" : state.taskFilter === "failed" ? "failed" : "";
   if (!status) return;
   const label = status === "completed" ? "成功" : "失败";
-  if (!confirm(`确定清空全部${label}任务记录？`)) return;
   try {
 	const result = await api(`/api/v1/transfers?status=${status}`, { method: "DELETE" });
 	toast(`已清空 ${result.removed} 条${label}任务`);
@@ -2398,11 +2440,16 @@ document.addEventListener("mousedown", (event) => {
   if (!event.target.closest("#terminalMenu, .terminal-button")) hideTerminalMenu();
 });
 document.addEventListener("keydown", (event) => {
-  if (!$("#imageDialog").open) return;
-  if (event.key === "ArrowLeft") changeImage(-1);
-  if (event.key === "ArrowRight") changeImage(1);
-  if (event.key === "+" || event.key === "=") setImageZoom(state.image.zoom * 1.2);
-  if (event.key === "-") setImageZoom(state.image.zoom / 1.2);
+  if ($("#imageDialog").open) {
+    if (event.key === "ArrowLeft") changeImage(-1);
+    if (event.key === "ArrowRight") changeImage(1);
+    if (event.key === "+" || event.key === "=") setImageZoom(state.image.zoom * 1.2);
+    if (event.key === "-") setImageZoom(state.image.zoom / 1.2);
+    return;
+  }
+  if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
+  if (event.target.closest("input, textarea, select, [contenteditable='true'], dialog")) return;
+  if (locateEntryByKey(state.activePane, event.key)) event.preventDefault();
 });
 window.addEventListener("blur", () => { hideContextMenu(); hideLocalTree(); hideBookmarkMenu(); hideTerminalMenu(); });
 setInterval(() => {

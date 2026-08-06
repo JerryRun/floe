@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -25,10 +26,27 @@ type SFTPFS struct {
 	client        *sftp.Client
 	dataOnce      sync.Once
 	dataClient    *sftp.Client
+	writeSlots    chan struct{}
 	keepAliveStop chan struct{}
 	keepAliveDone chan struct{}
 	closeOnce     sync.Once
 	closeErr      error
+}
+
+type sftpWriteAt struct {
+	*sftp.File
+}
+
+// FlushBlock asks servers that support fsync@openssh.com to make the block
+// durable before the transfer engine verifies or finalizes it. Older SFTP
+// servers may not implement the extension; their normal close semantics are
+// still valid, so unsupported is deliberately treated as a no-op.
+func (w *sftpWriteAt) FlushBlock() error {
+	err := w.File.Sync()
+	if errors.Is(err, sftp.ErrSSHFxOpUnsupported) {
+		return nil
+	}
+	return err
 }
 
 type SSHKeepAliveConfig struct {
@@ -38,7 +56,7 @@ type SSHKeepAliveConfig struct {
 }
 
 func NewSFTPFS(id, name, group, home string, sshClient *ssh.Client, client *sftp.Client, keepAlive SSHKeepAliveConfig) *SFTPFS {
-	fs := &SFTPFS{id: id, name: name, group: group, home: cleanRemote(home), ssh: sshClient, client: client}
+	fs := &SFTPFS{id: id, name: name, group: group, home: cleanRemote(home), ssh: sshClient, client: client, writeSlots: make(chan struct{}, 1)}
 	if keepAlive.Enabled && keepAlive.Interval > 0 && keepAlive.CountMax > 0 {
 		fs.keepAliveStop = make(chan struct{})
 		fs.keepAliveDone = make(chan struct{})
@@ -84,6 +102,16 @@ func (s *SFTPFS) Kind() string                         { return "sftp" }
 func (s *SFTPFS) Group() string                        { return s.group }
 func (s *SFTPFS) Location() string                     { return s.home }
 func (s *SFTPFS) DisplayPath(remotePath string) string { return cleanRemote(remotePath) }
+func (s *SFTPFS) MaxConcurrentWrites() int             { return 1 }
+
+func (s *SFTPFS) AcquireWriteSlot(ctx context.Context) (func(), error) {
+	select {
+	case s.writeSlots <- struct{}{}:
+		return func() { <-s.writeSlots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 func cleanRemote(p string) string {
 	if p == "" {
@@ -139,7 +167,7 @@ func (s *SFTPFS) OpenWrite(remotePath string, truncateTo *int64) (WriteAtCloser,
 			return nil, err
 		}
 	}
-	return f, nil
+	return &sftpWriteAt{File: f}, nil
 }
 
 // transferClient keeps bulk file traffic off the SFTP request channel used by
@@ -245,45 +273,82 @@ func (s *SFTPFS) WriteFileAtomic(remotePath string, data []byte) error {
 }
 
 func (s *SFTPFS) Mkdir(remotePath string) error {
-	return s.client.MkdirAll(cleanRemote(remotePath))
+	remotePath = cleanRemote(remotePath)
+	client := s.transferClient()
+	if err := client.MkdirAll(remotePath); err == nil || client == s.client {
+		return err
+	}
+	return s.client.MkdirAll(remotePath)
 }
 
 func (s *SFTPFS) Rename(oldPath, newPath string) error {
 	oldPath, newPath = cleanRemote(oldPath), cleanRemote(newPath)
-	if err := s.client.PosixRename(oldPath, newPath); err == nil {
-		return nil
+	clients := []*sftp.Client{s.transferClient()}
+	if clients[0] != s.client {
+		clients = append(clients, s.client)
 	}
-	return s.client.Rename(oldPath, newPath)
+	var lastErr error
+	var firstErr error
+	for _, client := range clients {
+		if err := client.PosixRename(oldPath, newPath); err == nil {
+			return nil
+		} else {
+			if firstErr == nil {
+				firstErr = err
+			}
+			lastErr = err
+		}
+		if err := client.Rename(oldPath, newPath); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	if len(clients) > 1 {
+		return fmt.Errorf("sftp rename failed (transfer=%v; control=%w)", firstErr, lastErr)
+	}
+	return lastErr
 }
 
 func (s *SFTPFS) Remove(remotePath string) error {
 	remotePath = cleanRemote(remotePath)
-	info, err := s.client.Lstat(remotePath)
+	client := s.transferClient()
+	info, err := client.Lstat(remotePath)
 	if err != nil {
-		return err
+		if client == s.client {
+			return err
+		}
+		info, err = s.client.Lstat(remotePath)
+		if err != nil {
+			return err
+		}
+		client = s.client
 	}
 	if !info.IsDir() {
+		if err := client.Remove(remotePath); err == nil || client == s.client {
+			return err
+		}
 		return s.client.Remove(remotePath)
 	}
-	return s.removeDir(remotePath)
+	return s.removeDir(client, remotePath)
 }
 
-func (s *SFTPFS) removeDir(remotePath string) error {
-	items, err := s.client.ReadDir(remotePath)
+func (s *SFTPFS) removeDir(client *sftp.Client, remotePath string) error {
+	items, err := client.ReadDir(remotePath)
 	if err != nil {
 		return err
 	}
 	for _, item := range items {
 		child := path.Join(remotePath, item.Name())
 		if item.IsDir() {
-			if err := s.removeDir(child); err != nil {
+			if err := s.removeDir(client, child); err != nil {
 				return err
 			}
-		} else if err := s.client.Remove(child); err != nil {
+		} else if err := client.Remove(child); err != nil {
 			return err
 		}
 	}
-	return s.client.RemoveDirectory(remotePath)
+	return client.RemoveDirectory(remotePath)
 }
 
 func (s *SFTPFS) Close() error {

@@ -850,7 +850,7 @@ func (s *Server) createTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	task.Blocks = nil
-	s.activity.Add("info", "transfer", "传输已加入队列", req.SourcePath+" → "+req.TargetPath)
+	s.activity.Add("info", "transfer", "传输已加入队列", req.SourcePath+" → "+req.TargetPath+" · 临时文件 "+task.PartPath)
 	writeJSON(w, http.StatusCreated, task)
 }
 

@@ -53,6 +53,12 @@ type ReadSlotController interface {
 	AcquireReadSlot(context.Context) (release func(), err error)
 }
 
+// WriteSlotController coordinates writes across tasks for providers whose
+// servers do not reliably keep multiple SFTP write handles alive at once.
+type WriteSlotController interface {
+	AcquireWriteSlot(context.Context) (release func(), err error)
+}
+
 // RangeSHA256Verifier lets a remote provider hash data next to its storage so
 // verified transfers do not need to download every target byte a second time.
 // The transfer engine falls back to ReadAt verification when unavailable.

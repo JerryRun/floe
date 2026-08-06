@@ -154,6 +154,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .file-entry.grid .file-size, .file-entry.grid .file-time, .file-entry.grid .file-mode { display: none; }
 .file-size, .file-time, .file-mode { color: var(--muted); font-family: var(--mono); font-size: 11px; }
 .empty-files { padding: 40px 12px; color: var(--muted); text-align: center; }
+.empty-files.loading { display: flex; align-items: center; justify-content: center; gap: 8px; }
+.loading-spinner { width: 14px; height: 14px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: loading-spin .8s linear infinite; }
+@keyframes loading-spin { to { transform: rotate(360deg); } }
 .pane-status { display: flex; justify-content: space-between; align-items: center; padding: 0 7px; border-top: 1px solid var(--line); background: var(--chrome); color: var(--muted); font-size: 11px; }
 .selection-label { max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pane-divider { position: relative; background: var(--chrome-dark); border-left: 1px solid var(--line); border-right: 1px solid var(--line); }

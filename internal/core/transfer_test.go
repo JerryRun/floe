@@ -112,6 +112,25 @@ func TestTransferBlockUsesRemoteSHA256WithoutReadingTargetBack(t *testing.T) {
 	}
 }
 
+func TestTransferBlockFallsBackToReadBackWhenRemoteSHA256IsStale(t *testing.T) {
+	sourceData := bytes.Repeat([]byte("remote-hash-fallback-"), 1024)
+	source := &memoryFile{data: append([]byte(nil), sourceData...)}
+	target := &memoryFile{data: make([]byte, len(sourceData))}
+	block := BlockState{Offset: 0, Length: int64(len(sourceData))}
+	stale := sha256.Sum256([]byte("stale remote view"))
+
+	digest, err := transferBlockProgress(context.Background(), source, target, target, block, nil, func() ([]byte, error) {
+		return stale[:], nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := sha256.Sum256(sourceData)
+	if digest != hex.EncodeToString(want[:]) {
+		t.Fatalf("digest = %s, want %x", digest, want)
+	}
+}
+
 func TestPartitionBlocksKeepsEachWorkerRangeContiguous(t *testing.T) {
 	blocks := make([]BlockState, 10)
 	for index := range blocks {

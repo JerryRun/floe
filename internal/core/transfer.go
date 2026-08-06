@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -64,6 +65,11 @@ type TransferEngine struct {
 	storePath   string
 	subscribers map[chan struct{}]struct{}
 	slots       chan struct{}
+	// finalizeMu prevents a burst of directory transfers from issuing
+	// competing remove/rename requests on the same remote control channel.
+	// Some SFTP/FTP servers otherwise acknowledge the write before the .part
+	// entry is visible to the following rename request.
+	finalizeMu sync.Mutex
 }
 
 func NewTransferEngine(manager *Manager, storePath string) *TransferEngine {
@@ -203,13 +209,41 @@ func (e *TransferEngine) Create(req TransferRequest) (TransferTask, error) {
 			req.Concurrency = limit
 		}
 	}
-	partPath := req.TargetPath + ".part"
+	// SFTP servers in the field may remove or hide a temporary file as soon as
+	// its write handle closes. Write SFTP targets directly to the final path;
+	// the block hash verification still prevents a task from being completed
+	// until every byte is correct. Other providers retain atomic temp files.
+	now := time.Now()
+	taskID := fmt.Sprintf("transfer-%d", now.UnixNano())
+	partPath := req.TargetPath
+	if target.Kind() != "sftp" {
+		// Directory uploads can overlap with an explicitly selected child
+		// file; never let tasks share a temporary path.
+		partPath += ".part-" + taskID
+	}
 	zero := int64(0)
+	// A directory task and an explicitly selected child can arrive at the
+	// same time. Do not create two writers for one destination; return the
+	// already queued task instead. The lock intentionally covers preparation
+	// so two concurrent HTTP requests cannot pass this check together.
+	e.mu.Lock()
+	for _, existing := range e.tasks {
+		if existing.TargetProvider == req.TargetProvider && existing.TargetPath == req.TargetPath &&
+			existing.Status != "completed" && existing.Status != "failed" {
+			snapshot := cloneTask(existing)
+			e.mu.Unlock()
+			return snapshot, nil
+		}
+	}
 	w, err := target.OpenWrite(partPath, &zero)
 	if err != nil {
+		e.mu.Unlock()
 		return TransferTask{}, fmt.Errorf("prepare target: %w", err)
 	}
-	_ = w.Close()
+	if err := w.Close(); err != nil {
+		e.mu.Unlock()
+		return TransferTask{}, fmt.Errorf("prepare target close: %w", err)
+	}
 
 	blockCount := int((info.Size + defaultBlockSize - 1) / defaultBlockSize)
 	blocks := make([]BlockState, blockCount)
@@ -218,14 +252,12 @@ func (e *TransferEngine) Create(req TransferRequest) (TransferTask, error) {
 		length := min(defaultBlockSize, info.Size-offset)
 		blocks[i] = BlockState{Index: i, Offset: offset, Length: length}
 	}
-	now := time.Now()
 	task := &TransferTask{
-		ID: fmt.Sprintf("transfer-%d", now.UnixNano()), SourceProvider: req.SourceProvider,
+		ID: taskID, SourceProvider: req.SourceProvider,
 		SourcePath: req.SourcePath, TargetProvider: req.TargetProvider, TargetPath: req.TargetPath,
 		PartPath: partPath, Size: info.Size, SourceModified: info.Modified, BlockSize: defaultBlockSize,
 		Concurrency: req.Concurrency, Status: "running", CreatedAt: now, UpdatedAt: now, Blocks: blocks,
 	}
-	e.mu.Lock()
 	e.tasks[task.ID] = task
 	e.saveLocked()
 	e.notifyLocked()
@@ -452,10 +484,14 @@ func (e *TransferEngine) run(ctx context.Context, id string) {
 		e.fail(id, errors.New("source file changed during transfer"))
 		return
 	}
-	_ = target.Remove(task.TargetPath)
-	if err := target.Rename(task.PartPath, task.TargetPath); err != nil {
-		e.fail(id, fmt.Errorf("finalize target: %w", err))
-		return
+	if task.PartPath != task.TargetPath {
+		if err := e.finalize(ctx, target, task.PartPath, task.TargetPath, task.Size); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			e.fail(id, fmt.Errorf("finalize target (%s → %s): %w", task.PartPath, task.TargetPath, err))
+			return
+		}
 	}
 	e.update(id, func(task *TransferTask) {
 		task.Status = "completed"
@@ -465,6 +501,75 @@ func (e *TransferEngine) run(ctx context.Context, id string) {
 	e.mu.Lock()
 	delete(e.cancels, id)
 	e.mu.Unlock()
+}
+
+func (e *TransferEngine) finalize(ctx context.Context, target FileSystem, partPath, targetPath string, expectedSize int64) error {
+	e.finalizeMu.Lock()
+	defer e.finalizeMu.Unlock()
+	var lastErr error
+	diagnostics := make([]string, 0, 8)
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// Removing an existing target is best effort: a missing destination is
+		// the normal case and must not prevent the atomic rename.
+		if err := target.Remove(targetPath); err != nil {
+			diagnostics = append(diagnostics, fmt.Sprintf("attempt %d remove target: %v", attempt+1, err))
+			if _, statErr := target.Stat(targetPath); statErr == nil {
+				lastErr = err
+				if attempt < 3 {
+					if !waitFinalizeRetry(ctx, time.Duration(attempt+1)*75*time.Millisecond) {
+						return ctx.Err()
+					}
+					continue
+				}
+				return err
+			}
+		}
+		partInfo, partStatErr := target.Stat(partPath)
+		if partStatErr != nil {
+			diagnostics = append(diagnostics, fmt.Sprintf("attempt %d part stat: %v", attempt+1, partStatErr))
+		} else {
+			diagnostics = append(diagnostics, fmt.Sprintf("attempt %d part stat: size=%d dir=%t", attempt+1, partInfo.Size, partInfo.IsDir))
+		}
+		if err := target.Rename(partPath, targetPath); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			diagnostics = append(diagnostics, fmt.Sprintf("attempt %d rename: %v", attempt+1, err))
+			// A lost SFTP reply can report an error even though the server
+			// completed the rename. Confirm the destination before retrying.
+			if info, statErr := target.Stat(targetPath); statErr == nil {
+				diagnostics = append(diagnostics, fmt.Sprintf("attempt %d target stat: size=%d dir=%t", attempt+1, info.Size, info.IsDir))
+				if !info.IsDir && info.Size == expectedSize {
+					return nil
+				}
+			} else {
+				diagnostics = append(diagnostics, fmt.Sprintf("attempt %d target stat: %v", attempt+1, statErr))
+			}
+		}
+		if attempt < 3 {
+			if !waitFinalizeRetry(ctx, time.Duration(attempt+1)*75*time.Millisecond) {
+				return ctx.Err()
+			}
+		}
+	}
+	if len(diagnostics) > 0 {
+		return fmt.Errorf("%w; %s", lastErr, strings.Join(diagnostics, " | "))
+	}
+	return lastErr
+}
+
+func waitFinalizeRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // partitionBlocks gives each worker one contiguous range. In particular, an
@@ -490,6 +595,13 @@ func (e *TransferEngine) worker(ctx context.Context, id string, source, target F
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	if controller, ok := target.(WriteSlotController); ok {
+		release, err := controller.AcquireWriteSlot(ctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
 	if controller, ok := source.(ReadSlotController); ok {
 		release, err := controller.AcquireReadSlot(ctx)
 		if err != nil {
@@ -506,12 +618,20 @@ func (e *TransferEngine) worker(ctx context.Context, id string, source, target F
 	if err != nil {
 		return fmt.Errorf("open target for writing: %w", err)
 	}
-	defer dst.Close()
+	defer func() {
+		if dst != nil {
+			_ = dst.Close()
+		}
+	}()
 	verify, err := target.OpenRead(partPath)
 	if err != nil {
 		return fmt.Errorf("open target for verification: %w", err)
 	}
-	defer verify.Close()
+	defer func() {
+		if verify != nil {
+			_ = verify.Close()
+		}
+	}()
 
 	for block := range jobs {
 		var digest string
@@ -548,6 +668,14 @@ func (e *TransferEngine) worker(ctx context.Context, id string, source, target F
 			}
 		})
 	}
+	if err := dst.Close(); err != nil {
+		return fmt.Errorf("close target after writing: %w", err)
+	}
+	dst = nil
+	if err := verify.Close(); err != nil {
+		return fmt.Errorf("close target after verification: %w", err)
+	}
+	verify = nil
 	return nil
 }
 
@@ -590,10 +718,12 @@ func transferBlockProgress(ctx context.Context, src io.ReaderAt, dst io.WriterAt
 	sourceDigest := sourceHash.Sum(nil)
 	if remoteHash != nil {
 		if targetDigest, err := remoteHash(); err == nil {
-			if !equalBytes(sourceDigest, targetDigest) {
-				return "", errors.New("source and target SHA-256 differ")
+			if equalBytes(sourceDigest, targetDigest) {
+				return hex.EncodeToString(sourceDigest), nil
 			}
-			return hex.EncodeToString(sourceDigest), nil
+			// A remote side hash can race the server's write-back/cache flush.
+			// Fall through to reading the target range before declaring the
+			// transfer corrupt; the read-back is the authoritative check.
 		}
 	}
 
