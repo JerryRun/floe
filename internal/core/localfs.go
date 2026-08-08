@@ -18,6 +18,14 @@ type LocalFS struct {
 	group string
 }
 
+type localWriteAt struct {
+	*os.File
+}
+
+func (w *localWriteAt) Close() error {
+	return errors.Join(w.File.Sync(), w.File.Close())
+}
+
 func NewLocalFS(id, name, root string) (*LocalFS, error) {
 	return NewLocalFSWithKind(id, name, root, "demo", "演示")
 }
@@ -146,7 +154,7 @@ func (l *LocalFS) OpenWrite(path string, truncateTo *int64) (WriteAtCloser, erro
 			return nil, err
 		}
 	}
-	return f, nil
+	return &localWriteAt{File: f}, nil
 }
 
 func (l *LocalFS) ReadFile(path string, limit int64) ([]byte, error) {
@@ -198,6 +206,18 @@ func (l *LocalFS) Rename(oldPath, newPath string) error {
 		return err
 	}
 	return os.Rename(oldFull, newFull)
+}
+
+func (l *LocalFS) Replace(oldPath, newPath string) error {
+	oldFull, err := l.resolve(oldPath)
+	if err != nil {
+		return err
+	}
+	newFull, err := l.resolve(newPath)
+	if err != nil {
+		return err
+	}
+	return replaceLocalFile(oldFull, newFull)
 }
 
 func (l *LocalFS) Remove(path string) error {

@@ -185,7 +185,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .transfer-queue.collapsed #queueToggle { transform: rotate(-90deg); }
 .task-list { overflow: auto; }
 .empty-row { padding: 18px 10px; color: var(--muted); }
-.task { height: 32px; display: grid; grid-template-columns: minmax(220px, 1.6fr) 110px 92px 82px 86px 76px; align-items: center; gap: 9px; padding: 0 8px; border-bottom: 1px solid var(--line-soft); font-size: 11px; }
+.task { min-width: 780px; height: 32px; display: grid; grid-template-columns: minmax(190px, 1.35fr) 130px 130px 95px 100px 82px; align-items: center; gap: 8px; padding: 0 8px; border-bottom: 1px solid var(--line-soft); font-size: 11px; }
 .task-route { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .progress-track { display: block; height: 6px; position: relative; overflow: hidden; background: var(--chrome-dark); }
 .progress-transferred, .progress-verified { display: block; position: absolute; inset: 0 auto 0 0; }

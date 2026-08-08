@@ -12,12 +12,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
+	minBlockSize       = int64(8 << 20)
 	defaultBlockSize   = int64(64 << 20)
-	transferBufferSize = 1 << 20
+	transferBufferSize = 4 << 20
 	progressStep       = int64(4 << 20)
 )
 
@@ -57,14 +59,29 @@ type TransferRequest struct {
 	Concurrency    int    `json:"concurrency"`
 }
 
+type transferRun struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	resume bool
+}
+
 type TransferEngine struct {
 	mu          sync.RWMutex
 	manager     *Manager
 	tasks       map[string]*TransferTask
-	cancels     map[string]context.CancelFunc
+	runs        map[string]*transferRun
+	revalidate  map[string]bool
 	storePath   string
 	subscribers map[chan struct{}]struct{}
-	slots       chan struct{}
+	// slots limits active block workers per target provider. Keeping this
+	// quota per provider is important: a burst of FTP tasks waiting for the
+	// FTP server's single STOR slot must not consume the quota needed by an
+	// unrelated SFTP or local target.
+	slotsMu sync.Mutex
+	slots   map[string]chan struct{}
+	// sequence makes task IDs unique when concurrent HTTP requests observe
+	// the same wall-clock timestamp (common on Windows timer resolution).
+	sequence atomic.Uint64
 	// finalizeMu prevents a burst of directory transfers from issuing
 	// competing remove/rename requests on the same remote control channel.
 	// Some SFTP/FTP servers otherwise acknowledge the write before the .part
@@ -74,12 +91,38 @@ type TransferEngine struct {
 
 func NewTransferEngine(manager *Manager, storePath string) *TransferEngine {
 	e := &TransferEngine{
-		manager: manager, tasks: make(map[string]*TransferTask), cancels: make(map[string]context.CancelFunc),
-		storePath: storePath, subscribers: make(map[chan struct{}]struct{}),
-		slots: make(chan struct{}, 8),
+		manager: manager, tasks: make(map[string]*TransferTask), runs: make(map[string]*transferRun),
+		revalidate: make(map[string]bool),
+		storePath:  storePath, subscribers: make(map[chan struct{}]struct{}),
+		slots: make(map[string]chan struct{}),
 	}
 	e.load()
 	return e
+}
+
+func (e *TransferEngine) transferSlot(providerID string) chan struct{} {
+	e.slotsMu.Lock()
+	defer e.slotsMu.Unlock()
+	if slots := e.slots[providerID]; slots != nil {
+		return slots
+	}
+	slots := make(chan struct{}, 8)
+	e.slots[providerID] = slots
+	return slots
+}
+
+func (e *TransferEngine) acquireTransferSlot(ctx context.Context, providerID string) (func(), error) {
+	slots := e.transferSlot(providerID)
+	select {
+	case slots <- struct{}{}:
+		return func() { <-slots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (e *TransferEngine) newTaskID() string {
+	return fmt.Sprintf("transfer-%d-%d", time.Now().UnixNano(), e.sequence.Add(1))
 }
 
 func (e *TransferEngine) load() {
@@ -100,6 +143,12 @@ func (e *TransferEngine) load() {
 			task.BytesTransferred = task.BytesVerified
 		}
 		e.tasks[task.ID] = task
+		for _, block := range task.Blocks {
+			if block.Verified && block.SHA256 != "" && task.Status != "completed" {
+				e.revalidate[task.ID] = true
+				break
+			}
+		}
 	}
 }
 
@@ -193,6 +242,9 @@ func (e *TransferEngine) Create(req TransferRequest) (TransferTask, error) {
 	if err != nil {
 		return TransferTask{}, err
 	}
+	if info.IsDir {
+		return TransferTask{}, errors.New("source path is a directory")
+	}
 	if req.Concurrency < 1 {
 		req.Concurrency = 4
 	}
@@ -209,17 +261,14 @@ func (e *TransferEngine) Create(req TransferRequest) (TransferTask, error) {
 			req.Concurrency = limit
 		}
 	}
-	// SFTP servers in the field may remove or hide a temporary file as soon as
-	// its write handle closes. Write SFTP targets directly to the final path;
-	// the block hash verification still prevents a task from being completed
-	// until every byte is correct. Other providers retain atomic temp files.
 	now := time.Now()
-	taskID := fmt.Sprintf("transfer-%d", now.UnixNano())
+	taskID := e.newTaskID()
+	// Some SFTP deployments hide a temporary path after its write handle closes
+	// or reject a rename from the transfer channel. Keep their proven direct
+	// path mode; local and FTP providers use isolated task temporary files.
 	partPath := req.TargetPath
 	if target.Kind() != "sftp" {
-		// Directory uploads can overlap with an explicitly selected child
-		// file; never let tasks share a temporary path.
-		partPath += ".part-" + taskID
+		partPath += ".floe-part-" + taskID
 	}
 	zero := int64(0)
 	// A directory task and an explicitly selected child can arrive at the
@@ -235,27 +284,33 @@ func (e *TransferEngine) Create(req TransferRequest) (TransferTask, error) {
 			return snapshot, nil
 		}
 	}
-	w, err := target.OpenWrite(partPath, &zero)
-	if err != nil {
-		e.mu.Unlock()
-		return TransferTask{}, fmt.Errorf("prepare target: %w", err)
-	}
-	if err := w.Close(); err != nil {
-		e.mu.Unlock()
-		return TransferTask{}, fmt.Errorf("prepare target close: %w", err)
+	// FTP creates the STOR target from the worker while holding its global
+	// write slot. Pre-opening it here would overlap another task's data
+	// connection and causes EOF on servers with a low per-user connection cap.
+	if target.Kind() != "ftp" {
+		w, err := target.OpenWrite(partPath, &zero)
+		if err != nil {
+			e.mu.Unlock()
+			return TransferTask{}, fmt.Errorf("prepare target: %w", err)
+		}
+		if err := w.Close(); err != nil {
+			e.mu.Unlock()
+			return TransferTask{}, fmt.Errorf("prepare target close: %w", err)
+		}
 	}
 
-	blockCount := int((info.Size + defaultBlockSize - 1) / defaultBlockSize)
+	blockSize := chooseBlockSize(info.Size, req.Concurrency)
+	blockCount := int((info.Size + blockSize - 1) / blockSize)
 	blocks := make([]BlockState, blockCount)
 	for i := range blocks {
-		offset := int64(i) * defaultBlockSize
-		length := min(defaultBlockSize, info.Size-offset)
+		offset := int64(i) * blockSize
+		length := min(blockSize, info.Size-offset)
 		blocks[i] = BlockState{Index: i, Offset: offset, Length: length}
 	}
 	task := &TransferTask{
 		ID: taskID, SourceProvider: req.SourceProvider,
 		SourcePath: req.SourcePath, TargetProvider: req.TargetProvider, TargetPath: req.TargetPath,
-		PartPath: partPath, Size: info.Size, SourceModified: info.Modified, BlockSize: defaultBlockSize,
+		PartPath: partPath, Size: info.Size, SourceModified: info.Modified, BlockSize: blockSize,
 		Concurrency: req.Concurrency, Status: "running", CreatedAt: now, UpdatedAt: now, Blocks: blocks,
 	}
 	e.tasks[task.ID] = task
@@ -269,7 +324,13 @@ func (e *TransferEngine) Create(req TransferRequest) (TransferTask, error) {
 func (e *TransferEngine) start(id string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	e.mu.Lock()
-	e.cancels[id] = cancel
+	if e.tasks[id] == nil || e.runs[id] != nil {
+		e.mu.Unlock()
+		cancel()
+		return
+	}
+	run := &transferRun{cancel: cancel, done: make(chan struct{})}
+	e.runs[id] = run
 	if task := e.tasks[id]; task != nil {
 		task.Status = "running"
 		task.Error = ""
@@ -279,7 +340,26 @@ func (e *TransferEngine) start(id string) {
 		e.notifyLocked()
 	}
 	e.mu.Unlock()
-	go e.run(ctx, id)
+	go func() {
+		defer e.finishRun(id, run)
+		e.run(ctx, id)
+	}()
+}
+
+func (e *TransferEngine) finishRun(id string, run *transferRun) {
+	e.mu.Lock()
+	if e.runs[id] != run {
+		e.mu.Unlock()
+		return
+	}
+	delete(e.runs, id)
+	close(run.done)
+	task := e.tasks[id]
+	restart := run.resume && task != nil && task.Status != "completed"
+	e.mu.Unlock()
+	if restart {
+		e.start(id)
+	}
 }
 
 func (e *TransferEngine) Pause(id string) error {
@@ -289,34 +369,33 @@ func (e *TransferEngine) Pause(id string) error {
 		e.mu.Unlock()
 		return errors.New("task not found")
 	}
-	cancel := e.cancels[id]
-	if cancel == nil {
+	run := e.runs[id]
+	if run == nil || (task.Status != "running" && task.Status != "verifying") {
 		e.mu.Unlock()
 		return errors.New("task is not running")
 	}
-	delete(e.cancels, id)
 	task.Status = "paused"
 	task.UpdatedAt = time.Now()
 	e.saveLocked()
 	e.notifyLocked()
 	e.mu.Unlock()
-	cancel()
+	run.cancel()
 	return nil
 }
 
 func (e *TransferEngine) Resume(id string) error {
-	e.mu.RLock()
+	e.mu.Lock()
 	task := e.tasks[id]
-	_, running := e.cancels[id]
 	var snapshot TransferTask
 	if task != nil {
 		snapshot = cloneTask(task)
 	}
-	e.mu.RUnlock()
+	run := e.runs[id]
+	e.mu.Unlock()
 	if task == nil {
 		return errors.New("task not found")
 	}
-	if running {
+	if run != nil && snapshot.Status != "paused" {
 		return errors.New("task is already running")
 	}
 	if snapshot.Status == "completed" {
@@ -327,6 +406,19 @@ func (e *TransferEngine) Resume(id string) error {
 	}
 	if _, ok := e.manager.Get(snapshot.TargetProvider); !ok {
 		return errors.New("target provider is disconnected")
+	}
+	if run != nil {
+		e.mu.Lock()
+		if current := e.runs[id]; current == run {
+			if current.resume {
+				e.mu.Unlock()
+				return errors.New("task resume is already queued")
+			}
+			current.resume = true
+			e.mu.Unlock()
+			return nil
+		}
+		e.mu.Unlock()
 	}
 	e.start(id)
 	return nil
@@ -339,14 +431,18 @@ func (e *TransferEngine) Delete(id string) error {
 		e.mu.Unlock()
 		return errors.New("task not found")
 	}
-	if cancel := e.cancels[id]; cancel != nil {
-		cancel()
-		delete(e.cancels, id)
+	run := e.runs[id]
+	if run != nil {
+		run.resume = false
+		run.cancel()
 	}
+	snapshot := cloneTask(task)
 	delete(e.tasks, id)
+	delete(e.revalidate, id)
 	e.saveLocked()
 	e.notifyLocked()
 	e.mu.Unlock()
+	e.cleanupPartialAfter(snapshot, run)
 	return nil
 }
 
@@ -355,24 +451,54 @@ func (e *TransferEngine) Clear(status string) (int, error) {
 		return 0, errors.New("only completed or failed tasks can be cleared")
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	removed := 0
+	type cleanup struct {
+		task TransferTask
+		run  *transferRun
+	}
+	cleanups := make([]cleanup, 0)
 	for id, task := range e.tasks {
 		if task.Status != status {
 			continue
 		}
-		if cancel := e.cancels[id]; cancel != nil {
-			cancel()
-			delete(e.cancels, id)
+		run := e.runs[id]
+		if run != nil {
+			run.resume = false
+			run.cancel()
 		}
+		cleanups = append(cleanups, cleanup{task: cloneTask(task), run: run})
 		delete(e.tasks, id)
+		delete(e.revalidate, id)
 		removed++
 	}
 	if removed > 0 {
 		e.saveLocked()
 		e.notifyLocked()
 	}
+	e.mu.Unlock()
+	for _, item := range cleanups {
+		e.cleanupPartialAfter(item.task, item.run)
+	}
 	return removed, nil
+}
+
+func (e *TransferEngine) cleanupPartialAfter(task TransferTask, run *transferRun) {
+	if task.PartPath == "" || task.PartPath == task.TargetPath {
+		return
+	}
+	cleanup := func() {
+		if target, ok := e.manager.Get(task.TargetProvider); ok {
+			_ = target.Remove(task.PartPath)
+		}
+	}
+	if run == nil {
+		go cleanup()
+		return
+	}
+	go func() {
+		<-run.done
+		cleanup()
+	}()
 }
 
 func (e *TransferEngine) run(ctx context.Context, id string) {
@@ -396,7 +522,7 @@ func (e *TransferEngine) run(ctx context.Context, id string) {
 		}
 	}
 	info, err := source.Stat(task.SourcePath)
-	if err != nil || info.Size != task.Size || info.Modified.Unix() != task.SourceModified.Unix() {
+	if err != nil || !sameSourceVersion(info, task) {
 		if err == nil {
 			err = errors.New("source file changed since the task was created")
 		}
@@ -404,34 +530,36 @@ func (e *TransferEngine) run(ctx context.Context, id string) {
 		return
 	}
 
-	// Previously verified blocks are re-read after restart/resume so the local
-	// manifest cannot hide an externally modified .part file.
-	hasVerifiedBlocks := false
-	for _, block := range task.Blocks {
-		if block.Verified && block.SHA256 != "" {
-			hasVerifiedBlocks = true
-			break
-		}
-	}
-	if hasVerifiedBlocks {
+	// A persisted manifest is untrusted after a restart, so verify its blocks
+	// once. In-process pause/resume keeps the already verified durable blocks
+	// and does not download them again.
+	e.mu.RLock()
+	needsValidation := e.revalidate[id]
+	e.mu.RUnlock()
+	if needsValidation {
 		e.update(id, func(task *TransferTask) { task.Status = "verifying" })
-	}
-	for i, block := range task.Blocks {
-		if !block.Verified || block.SHA256 == "" {
-			continue
+		for i, block := range task.Blocks {
+			if !block.Verified || block.SHA256 == "" {
+				continue
+			}
+			valid, verifyErr := verifyRange(ctx, target, task.PartPath, block)
+			if errors.Is(verifyErr, context.Canceled) {
+				return
+			}
+			if verifyErr != nil || !valid {
+				e.update(id, func(t *TransferTask) {
+					t.Blocks[i].Verified = false
+					t.Blocks[i].SHA256 = ""
+					t.BytesVerified -= block.Length
+					if t.BytesVerified < 0 {
+						t.BytesVerified = 0
+					}
+				})
+			}
 		}
-		valid, err := verifyRange(ctx, target, task.PartPath, block)
-		if err != nil || !valid {
-			e.update(id, func(t *TransferTask) {
-				t.Blocks[i].Verified = false
-				t.BytesVerified -= block.Length
-				if t.BytesVerified < 0 {
-					t.BytesVerified = 0
-				}
-			})
-		}
-	}
-	if hasVerifiedBlocks {
+		e.mu.Lock()
+		delete(e.revalidate, id)
+		e.mu.Unlock()
 		e.update(id, func(task *TransferTask) { task.Status = "running" })
 	}
 
@@ -449,8 +577,30 @@ func (e *TransferEngine) run(ctx context.Context, id string) {
 			pending = append(pending, block)
 		}
 	}
+	if task.Size == 0 && target.Kind() == "ftp" {
+		if controller, ok := target.(WriteSlotController); ok {
+			release, acquireErr := controller.AcquireWriteSlot(ctx)
+			if acquireErr != nil {
+				e.fail(id, acquireErr)
+				return
+			}
+			defer release()
+		}
+		zero := int64(0)
+		w, openErr := target.OpenWrite(task.PartPath, &zero)
+		if openErr != nil {
+			e.fail(id, fmt.Errorf("open empty FTP target: %w", openErr))
+			return
+		}
+		if closeErr := w.Close(); closeErr != nil {
+			e.fail(id, fmt.Errorf("close empty FTP target: %w", closeErr))
+			return
+		}
+	}
 	partitions := partitionBlocks(pending, task.Concurrency)
 	errCh := make(chan error, task.Concurrency)
+	workerCtx, cancelWorkers := context.WithCancel(ctx)
+	defer cancelWorkers()
 	var wg sync.WaitGroup
 	for _, blocks := range partitions {
 		jobs := make(chan BlockState, len(blocks))
@@ -461,26 +611,27 @@ func (e *TransferEngine) run(ctx context.Context, id string) {
 		wg.Add(1)
 		go func(jobs <-chan BlockState) {
 			defer wg.Done()
-			if err := e.worker(ctx, id, source, target, task.SourcePath, task.PartPath, jobs); err != nil && !errors.Is(err, context.Canceled) {
+			if err := e.worker(workerCtx, id, source, target, task.SourcePath, task.PartPath, jobs); err != nil && !errors.Is(err, context.Canceled) {
 				select {
 				case errCh <- err:
+					cancelWorkers()
 				default:
 				}
 			}
 		}(jobs)
 	}
 	wg.Wait()
+	if ctx.Err() != nil {
+		return
+	}
 	select {
 	case err := <-errCh:
 		e.fail(id, err)
 		return
 	default:
 	}
-	if ctx.Err() != nil {
-		return
-	}
 	finalInfo, err := source.Stat(task.SourcePath)
-	if err != nil || finalInfo.Size != task.Size || finalInfo.Modified.Unix() != task.SourceModified.Unix() {
+	if err != nil || !sameSourceVersion(finalInfo, task) {
 		e.fail(id, errors.New("source file changed during transfer"))
 		return
 	}
@@ -498,9 +649,6 @@ func (e *TransferEngine) run(ctx context.Context, id string) {
 		task.BytesVerified = task.Size
 		task.Error = ""
 	})
-	e.mu.Lock()
-	delete(e.cancels, id)
-	e.mu.Unlock()
 }
 
 func (e *TransferEngine) finalize(ctx context.Context, target FileSystem, partPath, targetPath string, expectedSize int64) error {
@@ -508,48 +656,24 @@ func (e *TransferEngine) finalize(ctx context.Context, target FileSystem, partPa
 	defer e.finalizeMu.Unlock()
 	var lastErr error
 	diagnostics := make([]string, 0, 8)
-	for attempt := 0; attempt < 4; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		// Removing an existing target is best effort: a missing destination is
-		// the normal case and must not prevent the atomic rename.
-		if err := target.Remove(targetPath); err != nil {
-			diagnostics = append(diagnostics, fmt.Sprintf("attempt %d remove target: %v", attempt+1, err))
-			if _, statErr := target.Stat(targetPath); statErr == nil {
-				lastErr = err
-				if attempt < 3 {
-					if !waitFinalizeRetry(ctx, time.Duration(attempt+1)*75*time.Millisecond) {
-						return ctx.Err()
-					}
-					continue
-				}
-				return err
-			}
-		}
-		partInfo, partStatErr := target.Stat(partPath)
-		if partStatErr != nil {
-			diagnostics = append(diagnostics, fmt.Sprintf("attempt %d part stat: %v", attempt+1, partStatErr))
+		partInfo, err := target.Stat(partPath)
+		if err != nil {
+			lastErr = fmt.Errorf("stat temporary file: %w", err)
+			diagnostics = append(diagnostics, fmt.Sprintf("attempt %d: %v", attempt+1, lastErr))
+		} else if partInfo.IsDir || partInfo.Size != expectedSize {
+			return fmt.Errorf("temporary file has size %d, expected %d", partInfo.Size, expectedSize)
 		} else {
-			diagnostics = append(diagnostics, fmt.Sprintf("attempt %d part stat: size=%d dir=%t", attempt+1, partInfo.Size, partInfo.IsDir))
-		}
-		if err := target.Rename(partPath, targetPath); err == nil {
-			return nil
-		} else {
-			lastErr = err
-			diagnostics = append(diagnostics, fmt.Sprintf("attempt %d rename: %v", attempt+1, err))
-			// A lost SFTP reply can report an error even though the server
-			// completed the rename. Confirm the destination before retrying.
-			if info, statErr := target.Stat(targetPath); statErr == nil {
-				diagnostics = append(diagnostics, fmt.Sprintf("attempt %d target stat: size=%d dir=%t", attempt+1, info.Size, info.IsDir))
-				if !info.IsDir && info.Size == expectedSize {
-					return nil
-				}
-			} else {
-				diagnostics = append(diagnostics, fmt.Sprintf("attempt %d target stat: %v", attempt+1, statErr))
+			lastErr = replaceVerifiedTarget(target, partPath, targetPath, expectedSize)
+			if lastErr == nil || finalizedTarget(target, partPath, targetPath, expectedSize) {
+				return nil
 			}
+			diagnostics = append(diagnostics, fmt.Sprintf("attempt %d: %v", attempt+1, lastErr))
 		}
-		if attempt < 3 {
+		if attempt < 2 {
 			if !waitFinalizeRetry(ctx, time.Duration(attempt+1)*75*time.Millisecond) {
 				return ctx.Err()
 			}
@@ -559,6 +683,113 @@ func (e *TransferEngine) finalize(ctx context.Context, target FileSystem, partPa
 		return fmt.Errorf("%w; %s", lastErr, strings.Join(diagnostics, " | "))
 	}
 	return lastErr
+}
+
+func replaceVerifiedTarget(target FileSystem, partPath, targetPath string, expectedSize int64) error {
+	if replacer, ok := target.(AtomicReplacer); ok {
+		if err := replacer.Replace(partPath, targetPath); err == nil {
+			return validateFinalTarget(target, targetPath, expectedSize)
+		}
+		if finalizedTarget(target, partPath, targetPath, expectedSize) {
+			return nil
+		}
+	}
+
+	// Protocols without atomic overwrite first get a direct rename for servers
+	// that overwrite by default. If that is rejected, move the old target to a
+	// backup and restore it if promoting the verified file fails.
+	if err := target.Rename(partPath, targetPath); err == nil {
+		return validateFinalTarget(target, targetPath, expectedSize)
+	} else if finalizedTarget(target, partPath, targetPath, expectedSize) {
+		return nil
+	}
+	if _, err := target.Stat(targetPath); err != nil {
+		return fmt.Errorf("rename temporary file: %w", err)
+	}
+	backupPath := fmt.Sprintf("%s.floe-backup-%d", targetPath, time.Now().UnixNano())
+	if err := target.Rename(targetPath, backupPath); err != nil {
+		return fmt.Errorf("preserve existing target: %w", err)
+	}
+	if err := target.Rename(partPath, targetPath); err != nil {
+		if finalizedTarget(target, partPath, targetPath, expectedSize) {
+			_ = target.Remove(backupPath)
+			return nil
+		}
+		if restoreErr := target.Rename(backupPath, targetPath); restoreErr != nil {
+			return fmt.Errorf("promote temporary file: %v; restore old target: %w", err, restoreErr)
+		}
+		return fmt.Errorf("promote temporary file: %w", err)
+	}
+	if err := validateFinalTarget(target, targetPath, expectedSize); err != nil {
+		_ = target.Remove(targetPath)
+		if restoreErr := target.Rename(backupPath, targetPath); restoreErr != nil {
+			return fmt.Errorf("final target validation: %v; restore old target: %w", err, restoreErr)
+		}
+		return err
+	}
+	_ = target.Remove(backupPath)
+	return nil
+}
+
+func validateFinalTarget(target FileSystem, targetPath string, expectedSize int64) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		info, err := target.Stat(targetPath)
+		if err == nil {
+			if info.IsDir || info.Size != expectedSize {
+				return fmt.Errorf("final target has size %d, expected %d", info.Size, expectedSize)
+			}
+			return nil
+		}
+		lastErr = err
+		if attempt < 2 {
+			time.Sleep(time.Duration(attempt+1) * 50 * time.Millisecond)
+		}
+	}
+	return fmt.Errorf("stat final target: %w", lastErr)
+}
+
+func finalizedTarget(target FileSystem, partPath, targetPath string, expectedSize int64) bool {
+	missing, err := pathMissing(target, partPath)
+	if err != nil || !missing {
+		return false
+	}
+	return validateFinalTarget(target, targetPath, expectedSize) == nil
+}
+
+func pathMissing(target FileSystem, filePath string) (bool, error) {
+	if _, err := target.Stat(filePath); err == nil {
+		return false, nil
+	} else if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	} else {
+		message := strings.ToLower(err.Error())
+		for _, fragment := range []string{"not found", "no such file", "no such file or directory", "550 ", "remote path not found"} {
+			if strings.Contains(message, fragment) {
+				return true, nil
+			}
+		}
+		return false, err
+	}
+}
+
+func sameSourceVersion(info FileInfo, task TransferTask) bool {
+	if info.IsDir || info.Size != task.Size {
+		return false
+	}
+	return info.Modified.Equal(task.SourceModified)
+}
+
+func chooseBlockSize(size int64, concurrency int) int64 {
+	if size <= 0 {
+		return minBlockSize
+	}
+	workers := max(1, concurrency)
+	desiredBlocks := int64(workers * 4)
+	blockSize := (size + desiredBlocks - 1) / desiredBlocks
+	const alignment = int64(1 << 20)
+	blockSize = ((blockSize + alignment - 1) / alignment) * alignment
+	return max(minBlockSize, min(defaultBlockSize, blockSize))
 }
 
 func waitFinalizeRetry(ctx context.Context, delay time.Duration) bool {
@@ -588,17 +819,39 @@ func partitionBlocks(blocks []BlockState, concurrency int) [][]BlockState {
 	return result
 }
 
-func (e *TransferEngine) worker(ctx context.Context, id string, source, target FileSystem, sourcePath, partPath string, jobs <-chan BlockState) error {
-	select {
-	case e.slots <- struct{}{}:
-		defer func() { <-e.slots }()
-	case <-ctx.Done():
-		return ctx.Err()
+type lazyReadAtCloser struct {
+	open   func() (ReadAtCloser, error)
+	reader ReadAtCloser
+	err    error
+}
+
+func (r *lazyReadAtCloser) ReadAt(buffer []byte, offset int64) (int, error) {
+	if r.reader == nil && r.err == nil {
+		r.reader, r.err = r.open()
 	}
+	if r.err != nil {
+		return 0, r.err
+	}
+	return r.reader.ReadAt(buffer, offset)
+}
+
+func (r *lazyReadAtCloser) Close() error {
+	if r.reader == nil {
+		return nil
+	}
+	return r.reader.Close()
+}
+
+func (e *TransferEngine) worker(ctx context.Context, id string, source, target FileSystem, sourcePath, partPath string, jobs <-chan BlockState) error {
+	releaseSlot, err := e.acquireTransferSlot(ctx, target.ID())
+	if err != nil {
+		return err
+	}
+	defer releaseSlot()
 	if controller, ok := target.(WriteSlotController); ok {
-		release, err := controller.AcquireWriteSlot(ctx)
-		if err != nil {
-			return err
+		release, acquireErr := controller.AcquireWriteSlot(ctx)
+		if acquireErr != nil {
+			return acquireErr
 		}
 		defer release()
 	}
@@ -623,32 +876,19 @@ func (e *TransferEngine) worker(ctx context.Context, id string, source, target F
 			_ = dst.Close()
 		}
 	}()
-	verify, err := target.OpenRead(partPath)
-	if err != nil {
-		return fmt.Errorf("open target for verification: %w", err)
-	}
-	defer func() {
-		if verify != nil {
-			_ = verify.Close()
-		}
-	}()
-
+	written := make([]BlockState, 0)
 	for block := range jobs {
 		var digest string
 		var transferErr error
 		for attempt := 1; attempt <= 3; attempt++ {
 			var sent, reported int64
-			var remoteHash func() ([]byte, error)
-			if verifier, ok := target.(RangeSHA256Verifier); ok {
-				remoteHash = func() ([]byte, error) { return verifier.SHA256Range(partPath, block.Offset, block.Length) }
-			}
-			digest, transferErr = transferBlockProgress(ctx, src, dst, verify, block, func(count int64) {
+			digest, transferErr = writeBlockProgress(ctx, src, dst, block, func(count int64) {
 				sent += count
 				if sent-reported >= progressStep {
 					e.addTransferred(id, sent-reported)
 					reported = sent
 				}
-			}, remoteHash)
+			})
 			if sent > reported {
 				e.addTransferred(id, sent-reported)
 			}
@@ -660,18 +900,57 @@ func (e *TransferEngine) worker(ctx context.Context, id string, source, target F
 		if transferErr != nil {
 			return fmt.Errorf("block %d failed after retries: %w", block.Index, transferErr)
 		}
-		e.update(id, func(task *TransferTask) {
-			if !task.Blocks[block.Index].Verified {
-				task.Blocks[block.Index].Verified = true
-				task.Blocks[block.Index].SHA256 = digest
-				task.BytesVerified += block.Length
-			}
-		})
+		block.SHA256 = digest
+		written = append(written, block)
 	}
 	if err := dst.Close(); err != nil {
 		return fmt.Errorf("close target after writing: %w", err)
 	}
 	dst = nil
+	for _, block := range written {
+		e.update(id, func(task *TransferTask) {
+			if !task.Blocks[block.Index].Verified {
+				task.Blocks[block.Index].SHA256 = block.SHA256
+			}
+		})
+	}
+
+	verify := newLazyVerifier(target, partPath)
+	defer func() {
+		if verify != nil {
+			_ = verify.Close()
+		}
+	}()
+	for _, block := range written {
+		var verifyErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			valid, err := verifyRangeWithReader(ctx, target, partPath, verify, block)
+			if err == nil && valid {
+				verifyErr = nil
+				break
+			}
+			if err == nil {
+				verifyErr = errors.New("source and target SHA-256 differ")
+				if rewriteErr := e.rewriteBlock(ctx, id, src, target, partPath, block); rewriteErr != nil {
+					verifyErr = rewriteErr
+				}
+			} else {
+				verifyErr = err
+			}
+			_ = verify.Close()
+			verify = newLazyVerifier(target, partPath)
+		}
+		if verifyErr != nil {
+			return fmt.Errorf("verify block %d after retries: %w", block.Index, verifyErr)
+		}
+		e.update(id, func(task *TransferTask) {
+			if !task.Blocks[block.Index].Verified {
+				task.Blocks[block.Index].Verified = true
+				task.Blocks[block.Index].SHA256 = block.SHA256
+				task.BytesVerified += block.Length
+			}
+		})
+	}
 	if err := verify.Close(); err != nil {
 		return fmt.Errorf("close target after verification: %w", err)
 	}
@@ -679,12 +958,73 @@ func (e *TransferEngine) worker(ctx context.Context, id string, source, target F
 	return nil
 }
 
+func newLazyVerifier(target FileSystem, partPath string) *lazyReadAtCloser {
+	return &lazyReadAtCloser{open: func() (ReadAtCloser, error) {
+		reader, err := target.OpenRead(partPath)
+		if err != nil {
+			return nil, fmt.Errorf("open target for verification: %w", err)
+		}
+		return reader, nil
+	}}
+}
+
+func (e *TransferEngine) rewriteBlock(ctx context.Context, id string, source io.ReaderAt, target FileSystem, partPath string, block BlockState) error {
+	destination, err := target.OpenWrite(partPath, nil)
+	if err != nil {
+		return fmt.Errorf("reopen target for repair: %w", err)
+	}
+	var sent int64
+	digest, writeErr := writeBlockProgress(ctx, source, destination, block, func(count int64) {
+		sent += count
+		e.addTransferred(id, count)
+	})
+	closeErr := destination.Close()
+	if writeErr != nil || closeErr != nil {
+		e.addTransferred(id, -sent)
+		return errors.Join(writeErr, closeErr)
+	}
+	if digest != block.SHA256 {
+		return errors.New("source changed while repairing target block")
+	}
+	return nil
+}
+
+func writeBlockProgress(ctx context.Context, src io.ReaderAt, dst io.WriterAt, block BlockState, progress func(int64)) (string, error) {
+	buf := transferBuffer(block.Length)
+	sourceHash := sha256.New()
+	remaining := block.Length
+	offset := block.Offset
+	for remaining > 0 {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		count := int64(len(buf))
+		if remaining < count {
+			count = remaining
+		}
+		chunk := buf[:count]
+		if err := readFullAt(src, chunk, offset); err != nil {
+			return "", err
+		}
+		_, _ = sourceHash.Write(chunk)
+		if err := writeFullAt(dst, chunk, offset); err != nil {
+			return "", err
+		}
+		if progress != nil {
+			progress(count)
+		}
+		offset += count
+		remaining -= count
+	}
+	return hex.EncodeToString(sourceHash.Sum(nil)), nil
+}
+
 func transferBlock(ctx context.Context, src io.ReaderAt, dst io.WriterAt, verify io.ReaderAt, block BlockState) (string, error) {
 	return transferBlockProgress(ctx, src, dst, verify, block, nil, nil)
 }
 
 func transferBlockProgress(ctx context.Context, src io.ReaderAt, dst io.WriterAt, verify io.ReaderAt, block BlockState, progress func(int64), remoteHash func() ([]byte, error)) (string, error) {
-	buf := make([]byte, transferBufferSize)
+	buf := transferBuffer(block.Length)
 	sourceHash := sha256.New()
 	remaining := block.Length
 	offset := block.Offset
@@ -769,18 +1109,29 @@ func (e *TransferEngine) addTransferred(id string, delta int64) {
 }
 
 func verifyRange(ctx context.Context, fs FileSystem, filePath string, block BlockState) (bool, error) {
+	return verifyRangeWithReader(ctx, fs, filePath, nil, block)
+}
+
+func verifyRangeWithReader(ctx context.Context, fs FileSystem, filePath string, reader io.ReaderAt, block BlockState) (bool, error) {
 	if verifier, ok := fs.(RangeSHA256Verifier); ok {
 		if digest, err := verifier.SHA256Range(filePath, block.Offset, block.Length); err == nil {
 			return hex.EncodeToString(digest) == block.SHA256, nil
 		}
 	}
-	f, err := fs.OpenRead(filePath)
-	if err != nil {
-		return false, err
+	var closer io.Closer
+	if reader == nil {
+		file, err := fs.OpenRead(filePath)
+		if err != nil {
+			return false, err
+		}
+		reader = file
+		closer = file
 	}
-	defer f.Close()
+	if closer != nil {
+		defer closer.Close()
+	}
 	h := sha256.New()
-	buf := make([]byte, transferBufferSize)
+	buf := transferBuffer(block.Length)
 	remaining, offset := block.Length, block.Offset
 	for remaining > 0 {
 		if err := ctx.Err(); err != nil {
@@ -790,7 +1141,7 @@ func verifyRange(ctx context.Context, fs FileSystem, filePath string, block Bloc
 		if remaining < count {
 			count = remaining
 		}
-		if err := readFullAt(f, buf[:count], offset); err != nil {
+		if err := readFullAt(reader, buf[:count], offset); err != nil {
 			return false, err
 		}
 		_, _ = h.Write(buf[:count])
@@ -798,6 +1149,17 @@ func verifyRange(ctx context.Context, fs FileSystem, filePath string, block Bloc
 		remaining -= count
 	}
 	return hex.EncodeToString(h.Sum(nil)) == block.SHA256, nil
+}
+
+func transferBuffer(length int64) []byte {
+	size := int64(transferBufferSize)
+	if length > 0 && length < size {
+		size = length
+	}
+	if size < 1 {
+		size = 1
+	}
+	return make([]byte, int(size))
 }
 
 func readFullAt(r io.ReaderAt, buf []byte, offset int64) error {
@@ -852,7 +1214,4 @@ func (e *TransferEngine) fail(id string, err error) {
 			task.Error = err.Error()
 		}
 	})
-	e.mu.Lock()
-	delete(e.cancels, id)
-	e.mu.Unlock()
 }

@@ -113,7 +113,7 @@ func printCLIUsage(w io.Writer) {
   --auth password|key --private-key PATH --group GROUP
   --keepalive --alive-interval 60 --alive-count 3
 
-get/put 复用 Floe 的分块并发传输引擎，每块写入后均回读并校验 SHA-256。`)
+get/put 复用 Floe 的分块并发传输引擎，每块写入后均通过远端 SHA-256 或回读校验。`)
 }
 
 func cliSessions(store *sessionStore, args []string, stdout io.Writer) error {

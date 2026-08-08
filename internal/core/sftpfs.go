@@ -11,10 +11,19 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+)
+
+const (
+	// SFTP supports pipelined random writes on the dedicated transfer channel.
+	// Keep a bounded number of handles so a batch can make progress in parallel
+	// without allowing an unbounded task fan-out to starve directory requests.
+	sftpMaxConcurrentWrites = 4
+	sftpTransferSlots       = 8
 )
 
 type SFTPFS struct {
@@ -27,6 +36,7 @@ type SFTPFS struct {
 	dataOnce      sync.Once
 	dataClient    *sftp.Client
 	writeSlots    chan struct{}
+	rangeHash     atomic.Int32
 	keepAliveStop chan struct{}
 	keepAliveDone chan struct{}
 	closeOnce     sync.Once
@@ -56,7 +66,7 @@ type SSHKeepAliveConfig struct {
 }
 
 func NewSFTPFS(id, name, group, home string, sshClient *ssh.Client, client *sftp.Client, keepAlive SSHKeepAliveConfig) *SFTPFS {
-	fs := &SFTPFS{id: id, name: name, group: group, home: cleanRemote(home), ssh: sshClient, client: client, writeSlots: make(chan struct{}, 1)}
+	fs := &SFTPFS{id: id, name: name, group: group, home: cleanRemote(home), ssh: sshClient, client: client, writeSlots: make(chan struct{}, sftpTransferSlots)}
 	if keepAlive.Enabled && keepAlive.Interval > 0 && keepAlive.CountMax > 0 {
 		fs.keepAliveStop = make(chan struct{})
 		fs.keepAliveDone = make(chan struct{})
@@ -102,7 +112,7 @@ func (s *SFTPFS) Kind() string                         { return "sftp" }
 func (s *SFTPFS) Group() string                        { return s.group }
 func (s *SFTPFS) Location() string                     { return s.home }
 func (s *SFTPFS) DisplayPath(remotePath string) string { return cleanRemote(remotePath) }
-func (s *SFTPFS) MaxConcurrentWrites() int             { return 1 }
+func (s *SFTPFS) MaxConcurrentWrites() int             { return sftpMaxConcurrentWrites }
 
 func (s *SFTPFS) AcquireWriteSlot(ctx context.Context) (func(), error) {
 	select {
@@ -194,6 +204,9 @@ func (s *SFTPFS) transferClient() *sftp.Client {
 // SSH. Servers without a shell, dd, head or sha256sum are handled by the
 // transfer engine's normal SFTP read-back fallback.
 func (s *SFTPFS) SHA256Range(remotePath string, offset, length int64) ([]byte, error) {
+	if s.rangeHash.Load() < 0 {
+		return nil, errors.New("remote SHA-256 is unavailable")
+	}
 	const unit = int64(1 << 20)
 	if offset < 0 || length < 0 || offset%unit != 0 {
 		return nil, errors.New("range is not MiB-aligned")
@@ -210,16 +223,23 @@ func (s *SFTPFS) SHA256Range(remotePath string, offset, length int64) ([]byte, e
 	)
 	output, err := session.Output(command)
 	if err != nil {
+		var exitError *ssh.ExitError
+		if errors.As(err, &exitError) && (exitError.ExitStatus() == 126 || exitError.ExitStatus() == 127) {
+			s.rangeHash.Store(-1)
+		}
 		return nil, err
 	}
 	fields := strings.Fields(string(output))
 	if len(fields) == 0 || len(fields[0]) != sha256HexLength {
+		s.rangeHash.Store(-1)
 		return nil, fmt.Errorf("unexpected sha256sum output: %q", strings.TrimSpace(string(output)))
 	}
 	digest, err := hex.DecodeString(fields[0])
 	if err != nil || len(digest) != sha256HexLength/2 {
+		s.rangeHash.Store(-1)
 		return nil, fmt.Errorf("invalid sha256sum digest: %q", fields[0])
 	}
+	s.rangeHash.Store(1)
 	return digest, nil
 }
 
@@ -308,6 +328,23 @@ func (s *SFTPFS) Rename(oldPath, newPath string) error {
 		return fmt.Errorf("sftp rename failed (transfer=%v; control=%w)", firstErr, lastErr)
 	}
 	return lastErr
+}
+
+func (s *SFTPFS) Replace(oldPath, newPath string) error {
+	oldPath, newPath = cleanRemote(oldPath), cleanRemote(newPath)
+	clients := []*sftp.Client{s.transferClient()}
+	if clients[0] != s.client {
+		clients = append(clients, s.client)
+	}
+	var errs []error
+	for _, client := range clients {
+		if err := client.PosixRename(oldPath, newPath); err == nil {
+			return nil
+		} else {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (s *SFTPFS) Remove(remotePath string) error {

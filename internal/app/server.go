@@ -20,6 +20,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -265,6 +266,8 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		s.mkdir(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/files/create":
 		s.createFile(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/files/rename":
+		s.renameFile(w, r)
 	case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/files":
 		s.deleteFile(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/local/directories":
@@ -352,6 +355,16 @@ func (s *Server) providers() []core.ProviderInfo {
 		connectedIDs[provider.ID] = true
 	}
 	for _, saved := range s.sessionStore.List() {
+		if index := slices.IndexFunc(connected, func(item core.ProviderInfo) bool { return item.ID == saved.ID }); index >= 0 {
+			// The live provider intentionally exposes only its safe runtime
+			// identity. Merge the saved, non-secret connection fields so the
+			// client can show a useful tooltip without another request.
+			connected[index].Host = saved.Host
+			connected[index].Port = saved.Port
+			connected[index].User = saved.User
+			connected[index].AuthMethod = saved.AuthMethod
+			continue
+		}
 		if !connectedIDs[saved.ID] {
 			connected = append(connected, saved)
 		}
@@ -631,6 +644,56 @@ func (s *Server) createFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]bool{"ok": true})
 }
 
+func (s *Server) renameFile(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Provider string `json:"provider"`
+		Path     string `json:"path"`
+		NewPath  string `json:"new_path"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.Path) == "" || strings.TrimSpace(req.NewPath) == "" {
+		writeError(w, http.StatusBadRequest, "RENAME_INVALID", "原路径和新路径不能为空", "")
+		return
+	}
+	provider, ok := s.provider(w, req.Provider)
+	if !ok {
+		return
+	}
+	if _, err := provider.Stat(req.Path); err != nil {
+		writeError(w, http.StatusBadRequest, "RENAME_SOURCE_MISSING", "原文件或目录不存在", err.Error())
+		return
+	}
+	if _, err := provider.Stat(req.NewPath); err == nil {
+		writeError(w, http.StatusConflict, "RENAME_TARGET_EXISTS", "目标名称已经存在", "")
+	} else if !isNotFoundError(err) {
+		writeError(w, http.StatusBadRequest, "RENAME_TARGET_CHECK_FAILED", "无法检查目标名称", err.Error())
+		return
+	}
+	if err := provider.Rename(req.Path, req.NewPath); err != nil {
+		writeError(w, http.StatusBadRequest, "RENAME_FAILED", "重命名失败", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": req.NewPath})
+}
+
+func isNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	for _, fragment := range []string{"not found", "no such file", "no such file or directory", "remote path not found", "does not exist", "file does not exist"} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) deleteFile(w http.ResponseWriter, r *http.Request) {
 	var req struct{ Provider, Path string }
 	if !decodeJSON(w, r, &req) {
@@ -881,6 +944,8 @@ func (s *Server) enqueueDirectory(source, target core.FileSystem, req core.Trans
 		if len(*tasks) >= limit {
 			return fmt.Errorf("目录中文件超过 %d 个限制", limit)
 		}
+		// Keep directory fan-out conservative. SFTP/FTP providers already
+		// serialize writes; one worker per child avoids bursty server failures.
 		child.Concurrency = 1
 		task, err := s.transfers.Create(child)
 		if err != nil {

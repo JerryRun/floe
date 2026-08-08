@@ -45,3 +45,22 @@ func TestFTPReadSlotsReserveBrowsingConnectionAndHonorCancellation(t *testing.T)
 		release()
 	}
 }
+
+func TestFTPWriteSlotsSerializeTasksAndHonorCancellation(t *testing.T) {
+	provider := &FTPFS{writeSlots: make(chan struct{}, 1)}
+	release, err := provider.AcquireWriteSlot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := provider.AcquireWriteSlot(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waiting write slot error = %v, want context canceled", err)
+	}
+	release()
+	if release, err = provider.AcquireWriteSlot(context.Background()); err != nil {
+		t.Fatal(err)
+	} else {
+		release()
+	}
+}

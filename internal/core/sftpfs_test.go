@@ -65,4 +65,7 @@ func TestSFTPLocationUsesRemoteHome(t *testing.T) {
 	if got := provider.Location(); got != "/home/floe" {
 		t.Fatalf("SFTP location = %q, want remote home", got)
 	}
+	if got := provider.MaxConcurrentWrites(); got != sftpMaxConcurrentWrites {
+		t.Fatalf("SFTP write concurrency = %d, want %d", got, sftpMaxConcurrentWrites)
+	}
 }

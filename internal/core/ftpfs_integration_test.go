@@ -47,8 +47,8 @@ func TestFTPIntegrationUploadDownloadAndSHA256(t *testing.T) {
 	manager.Add(ftpFS)
 	engine := NewTransferEngine(manager, filepath.Join(root, "tasks.json"))
 
-	// More than one 64 MiB block exercises resumed FTP reads/writes and verifies
-	// every block. FTP providers may reduce concurrency to match server limits.
+	// A multi-block file exercises resumed FTP reads/writes and verifies every
+	// adaptive range. FTP providers may reduce concurrency to match server limits.
 	content := make([]byte, defaultBlockSize+(3<<20))
 	for i := range content {
 		content[i] = byte((i*31 + 17) % 251)

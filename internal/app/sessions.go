@@ -457,6 +457,7 @@ func (s *sessionStore) decrypt(value string) (string, error) {
 func (s savedSession) providerInfo(connected bool) core.ProviderInfo {
 	return core.ProviderInfo{
 		ID: s.ID, Name: s.Name, Kind: s.Protocol, Group: s.Group,
-		Location: fmt.Sprintf("%s:%d", s.Host, s.Port), Connected: connected,
+		Location: fmt.Sprintf("%s:%d", s.Host, s.Port), Host: s.Host, Port: s.Port,
+		User: s.User, AuthMethod: s.AuthMethod, Connected: connected,
 	}
 }

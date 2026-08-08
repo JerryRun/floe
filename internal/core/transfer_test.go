@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -38,6 +39,22 @@ type recordingWriteFS struct {
 type readLimitedFS struct {
 	FileSystem
 	limit int
+}
+
+type failingReplaceFS struct {
+	FileSystem
+	finalName string
+}
+
+func (f *failingReplaceFS) Replace(_, _ string) error {
+	return errors.New("atomic replace unavailable")
+}
+
+func (f *failingReplaceFS) Rename(oldPath, newPath string) error {
+	if strings.Contains(oldPath, ".floe-part-") && filepath.Base(newPath) == f.finalName {
+		return errors.New("promotion deliberately failed")
+	}
+	return f.FileSystem.Rename(oldPath, newPath)
 }
 
 func (r readLimitedFS) MaxConcurrentReads() int { return r.limit }
@@ -154,6 +171,37 @@ func TestPartitionBlocksKeepsEachWorkerRangeContiguous(t *testing.T) {
 	}
 }
 
+func TestTransferWorkerSlotsAreIsolatedByTargetProvider(t *testing.T) {
+	engine := NewTransferEngine(NewManager(), filepath.Join(t.TempDir(), "tasks.json"))
+	ctx := context.Background()
+	ftpReleases := make([]func(), 0, 8)
+	for i := 0; i < 8; i++ {
+		release, err := engine.acquireTransferSlot(ctx, "ftp")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ftpReleases = append(ftpReleases, release)
+	}
+	defer func() {
+		for _, release := range ftpReleases {
+			release()
+		}
+	}()
+
+	// A saturated FTP queue must not prevent an SFTP target from starting.
+	sftpRelease, err := engine.acquireTransferSlot(ctx, "sftp")
+	if err != nil {
+		t.Fatalf("SFTP slot was blocked by FTP workers: %v", err)
+	}
+	sftpRelease()
+
+	blockedCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := engine.acquireTransferSlot(blockedCtx, "ftp"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("FTP slot was not saturated, got %v", err)
+	}
+}
+
 func TestEngineCopiesLocalFileAndPersistsVerifiedTask(t *testing.T) {
 	root := t.TempDir()
 	sourceRoot, targetRoot := filepath.Join(root, "a"), filepath.Join(root, "b")
@@ -195,6 +243,48 @@ func TestEngineCopiesLocalFileAndPersistsVerifiedTask(t *testing.T) {
 	t.Fatal("transfer did not complete before deadline")
 }
 
+func TestEngineConcurrentCreatesUseUniqueTaskIDs(t *testing.T) {
+	root := t.TempDir()
+	sourceRoot, targetRoot := filepath.Join(root, "source"), filepath.Join(root, "target")
+	source, _ := NewLocalFS("source", "Source", sourceRoot)
+	target, _ := NewLocalFS("target", "Target", targetRoot)
+	manager := NewManager()
+	manager.Add(source)
+	manager.Add(target)
+	for _, name := range []string{"one.bin", "two.bin"} {
+		if err := os.WriteFile(filepath.Join(sourceRoot, name), bytes.Repeat([]byte(name), 1024), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	engine := NewTransferEngine(manager, filepath.Join(root, "tasks.json"))
+	type result struct {
+		task TransferTask
+		err  error
+	}
+	results := make(chan result, 2)
+	for _, name := range []string{"one.bin", "two.bin"} {
+		go func(name string) {
+			task, err := engine.Create(TransferRequest{
+				SourceProvider: "source", SourcePath: "/" + name,
+				TargetProvider: "target", TargetPath: "/" + name, Concurrency: 1,
+			})
+			results <- result{task: task, err: err}
+		}(name)
+	}
+	first, second := <-results, <-results
+	if first.err != nil {
+		t.Fatal(first.err)
+	}
+	if second.err != nil {
+		t.Fatal(second.err)
+	}
+	if first.task.ID == second.task.ID {
+		t.Fatalf("concurrent creates reused task ID %q", first.task.ID)
+	}
+	waitForTaskStatus(t, engine, first.task.ID, "completed")
+	waitForTaskStatus(t, engine, second.task.ID, "completed")
+}
+
 func TestEngineCreatesPartFileWithoutPreallocatingFullSourceSize(t *testing.T) {
 	root := t.TempDir()
 	sourceRoot, targetRoot := filepath.Join(root, "source"), filepath.Join(root, "target")
@@ -218,6 +308,69 @@ func TestEngineCreatesPartFileWithoutPreallocatingFullSourceSize(t *testing.T) {
 		t.Fatalf("initial part-file truncate values = %v, want first value 0", target.truncateValues)
 	}
 	waitForTaskStatus(t, engine, task.ID, "completed")
+}
+
+func TestEnginePreservesExistingTargetWhenPromotionFails(t *testing.T) {
+	root := t.TempDir()
+	sourceRoot, targetRoot := filepath.Join(root, "source"), filepath.Join(root, "target")
+	source, _ := NewLocalFS("source", "Source", sourceRoot)
+	targetLocal, _ := NewLocalFS("target", "Target", targetRoot)
+	old := []byte("old complete target")
+	if err := os.WriteFile(filepath.Join(targetRoot, "file.bin"), old, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceRoot, "file.bin"), bytes.Repeat([]byte("new data"), 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := &failingReplaceFS{FileSystem: targetLocal, finalName: "file.bin"}
+	manager := NewManager()
+	manager.Add(source)
+	manager.Add(target)
+	engine := NewTransferEngine(manager, filepath.Join(root, "tasks.json"))
+	task, err := engine.Create(TransferRequest{SourceProvider: "source", SourcePath: "/file.bin", TargetProvider: "target", TargetPath: "/file.bin", Concurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.PartPath == task.TargetPath || !strings.Contains(task.PartPath, ".floe-part-") {
+		t.Fatalf("task did not use an isolated temporary path: %#v", task)
+	}
+	waitForTaskStatus(t, engine, task.ID, "failed")
+	got, err := os.ReadFile(filepath.Join(targetRoot, "file.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, old) {
+		t.Fatal("failed promotion replaced the previous complete target")
+	}
+}
+
+func TestChooseBlockSizeKeepsEnoughResumeRanges(t *testing.T) {
+	tests := []struct {
+		size, want  int64
+		concurrency int
+	}{
+		{size: 1 << 20, concurrency: 4, want: minBlockSize},
+		{size: 256 << 20, concurrency: 4, want: 16 << 20},
+		{size: 8 << 30, concurrency: 4, want: defaultBlockSize},
+	}
+	for _, test := range tests {
+		if got := chooseBlockSize(test.size, test.concurrency); got != test.want {
+			t.Fatalf("chooseBlockSize(%d, %d) = %d, want %d", test.size, test.concurrency, got, test.want)
+		}
+	}
+}
+
+func BenchmarkTransferBlockProgress(b *testing.B) {
+	data := bytes.Repeat([]byte("floe-throughput\n"), 512*1024)
+	source := &memoryFile{data: data}
+	block := BlockState{Offset: 0, Length: int64(len(data))}
+	b.SetBytes(int64(len(data)))
+	for i := 0; i < b.N; i++ {
+		target := &memoryFile{data: make([]byte, len(data))}
+		if _, err := transferBlock(context.Background(), source, target, target, block); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 func TestEnginePauseResumeAndDelete(t *testing.T) {

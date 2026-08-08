@@ -33,16 +33,17 @@ type FTPConfig struct {
 }
 
 type FTPFS struct {
-	id        string
-	name      string
-	group     string
-	config    FTPConfig
-	mu        sync.Mutex
-	client    *ftpclient.ServerConn
-	readSlots chan struct{}
-	stop      chan struct{}
-	closed    bool
-	once      sync.Once
+	id         string
+	name       string
+	group      string
+	config     FTPConfig
+	mu         sync.Mutex
+	client     *ftpclient.ServerConn
+	readSlots  chan struct{}
+	writeSlots chan struct{}
+	stop       chan struct{}
+	closed     bool
+	once       sync.Once
 }
 
 func NewFTPFS(id, name, group string, config FTPConfig) (*FTPFS, error) {
@@ -52,7 +53,7 @@ func NewFTPFS(id, name, group string, config FTPConfig) (*FTPFS, error) {
 	}
 	provider := &FTPFS{
 		id: id, name: name, group: group, config: config, client: client,
-		readSlots: make(chan struct{}, ftpTransferSlots), stop: make(chan struct{}),
+		readSlots: make(chan struct{}, ftpTransferSlots), writeSlots: make(chan struct{}, 1), stop: make(chan struct{}),
 	}
 	go provider.keepAlive()
 	return provider, nil
@@ -110,6 +111,24 @@ func (f *FTPFS) AcquireReadSlot(ctx context.Context) (func(), error) {
 	select {
 	case f.readSlots <- struct{}{}:
 		return func() { <-f.readSlots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// AcquireWriteSlot serializes FTP data writers across tasks. FTP servers
+// commonly allow several control/list connections but reject overlapping
+// STOR data connections for the same account or filesystem.
+func (f *FTPFS) AcquireWriteSlot(ctx context.Context) (func(), error) {
+	f.mu.Lock()
+	if f.writeSlots == nil {
+		f.writeSlots = make(chan struct{}, 1)
+	}
+	slots := f.writeSlots
+	f.mu.Unlock()
+	select {
+	case slots <- struct{}{}:
+		return func() { <-slots }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}

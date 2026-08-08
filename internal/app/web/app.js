@@ -213,7 +213,7 @@ function renderSessionTree() {
       const item = document.createElement("div");
       item.className = `session-item${currentProvider(state.activePane) === provider.id ? " active" : ""}`;
       item.draggable = true;
-      item.title = provider.kind === "local" ? "双击打开，或拖到任一标签栏" : "双击连接；右键查看、修改或删除配置";
+      item.title = sessionTooltip(provider);
       item.innerHTML = `<span class="session-icon">${sessionIcon(provider)}</span><span class="session-name">${escapeHTML(provider.name)}</span>`;
       item.addEventListener("click", () => { state.sessionSelected = provider.id; });
       item.addEventListener("dblclick", () => openSession("right", provider.id));
@@ -235,6 +235,18 @@ function renderSessionTree() {
     group.append(head, items);
     tree.append(group);
   }
+}
+
+function sessionTooltip(provider) {
+  if (provider.kind === "local") return "本地文件系统\n双击打开，或拖到任一标签栏";
+  const protocol = (provider.kind || "session").toUpperCase();
+  const endpoint = provider.host ? `${provider.host}:${provider.port || (provider.kind === "ftp" ? 21 : 22)}` : (provider.location || "未连接");
+  const lines = [`协议：${protocol}`, `地址：${endpoint}`];
+  if (provider.user) lines.push(`用户：${provider.user}`);
+  if (provider.auth_method) lines.push(`认证：${provider.auth_method === "key" ? "SSH 密钥" : "密码"}`);
+  if (provider.group) lines.push(`分组：${provider.group}`);
+  lines.push(provider.connected ? "状态：已连接" : "状态：未连接（双击连接）");
+  return lines.join("\n");
 }
 
 function sessionIcon(provider) {
@@ -329,6 +341,7 @@ function renderTabs(side) {
     node.className = `tab${panel.active === tab.provider ? " active" : ""}`;
     node.draggable = true;
     node.dataset.provider = tab.provider;
+    node.title = sessionTooltip(provider);
     const pinned = side === "left" && provider.id === "local";
     node.innerHTML = `<span class="tab-icon">${sessionIcon(provider)}</span><span class="tab-name">${escapeHTML(provider.name)}</span>${pinned ? "" : '<span class="tab-close" aria-label="关闭"><span class="material-symbols-rounded" aria-hidden="true">close</span></span>'}`;
     node.addEventListener("click", (event) => {
@@ -710,31 +723,134 @@ async function transferEntries(fromSide, toSide, entries) {
     const succeeded = results.filter((result) => result.status === "fulfilled").length;
     const failed = results.length - succeeded;
     if (succeeded) {
+      // Directory transfers create the destination directory before their
+      // child tasks are queued. Reflect that server-side mkdir immediately;
+      // individual files will be appended as their transfers complete.
+      if (currentProvider(toSide) === target.provider && currentPath(toSide) === target.path) {
+        results.forEach((result, index) => {
+          if (result.status !== "fulfilled" || !result.value?.directory || !transferable[index].is_dir) return;
+          upsertPanelEntry(toSide, {
+            name: transferable[index].name,
+            path: joinPath(target.path, transferable[index].name),
+            size: 0,
+            mode: "drwxr-xr-x",
+            modified: new Date().toISOString(),
+            is_dir: true,
+            is_link: false,
+          });
+        });
+      }
       $("#transferQueue").classList.remove("collapsed");
       state.taskFilter = "queue";
       renderTaskList();
     }
     if (failed) {
-      const firstError = results.find((result) => result.status === "rejected")?.reason?.message;
-      toast(succeeded ? `已开始传输 ${succeeded} 项，${failed} 项失败` : firstError || "传输失败", "error");
+      const failedDetails = results.map((result, index) => {
+        if (result.status !== "rejected") return null;
+        const message = result.reason?.message || "创建任务失败";
+        return `${transferable[index].name}: ${message}`;
+      }).filter(Boolean);
+      const prefix = succeeded ? `已开始传输 ${succeeded} 项，${failed} 项失败` : "传输任务创建失败";
+      toast(`${prefix} · ${failedDetails.slice(0, 2).join("；")}${failedDetails.length > 2 ? "；…" : ""}`, "error");
     } else {
       toast(succeeded === 1 ? `开始传输 ${transferable[0].name}` : `已开始传输 ${succeeded} 项`);
     }
 }
 
-async function deleteEntry(side, entry) {
-  if (!confirm(`确定删除“${entry.name}”？${entry.is_dir ? "\n目录及其内容会一起删除。" : ""}`)) return;
+async function deleteEntries(side, entries) {
+  const unique = [...new Map((entries || []).map((entry) => [entry.path, entry])).values()];
+  if (!unique.length) return;
+  const directories = unique.filter((entry) => entry.is_dir).length;
+  const promptText = unique.length === 1
+    ? `确定删除“${unique[0].name}”？${unique[0].is_dir ? "\n目录及其内容会一起删除。" : ""}`
+    : `确定删除选中的 ${unique.length} 项？${directories ? `\n其中包含 ${directories} 个目录，目录内容也会一起删除。` : ""}`;
+  if (!confirm(promptText)) return;
+
+  // Delete deeper paths first so selecting both a directory and one of its
+  // descendants cannot make the child request fail after its parent vanished.
+  const ordered = [...unique].sort((a, b) => b.path.split("/").length - a.path.split("/").length);
+  const deleted = new Set();
+  const failures = [];
+  for (const entry of ordered) {
+    try {
+      await api("/api/v1/files", {
+        method: "DELETE",
+        body: JSON.stringify({ provider: currentProvider(side), path: entry.path }),
+      });
+      deleted.add(entry.path);
+    } catch (error) {
+      failures.push(`${entry.name}: ${error.message}`);
+    }
+  }
+  const panel = state.panels[side];
+  panel.entries = panel.entries.filter((entry) => !deleted.has(entry.path));
+  for (const path of deleted) panel.selection.delete(path);
+  panel.selectionAnchor = -1;
+  panelElements(side).count.textContent = `${panel.entries.length.toLocaleString()} 项`;
+  updateSelectionLabel(side);
+  renderPanel(side);
+  if (failures.length) {
+    toast(`已删除 ${deleted.size} 项，${failures.length} 项失败 · ${failures.slice(0, 2).join("；")}${failures.length > 2 ? "；…" : ""}`, "error");
+  } else {
+    toast(unique.length === 1 ? "已删除" : `已删除 ${deleted.size} 项`);
+  }
+}
+
+async function renameEntry(side, entry) {
+  const nextName = prompt(entry.is_dir ? "重命名目录" : "重命名文件", entry.name)?.trim();
+  if (!nextName || nextName === entry.name) return;
+  if (nextName === "." || nextName === ".." || /[\\/]/.test(nextName)) {
+    toast("名称不能包含 / 或 \\，也不能是 . 或 ..", "error");
+    return;
+  }
+  const oldPath = entry.path;
+  const newPath = joinPath(parentPath(oldPath), nextName);
   try {
-    await api("/api/v1/files", { method: "DELETE", body: JSON.stringify({ provider: currentProvider(side), path: entry.path }) });
-    await loadPanel(side); toast("已删除");
+    await api("/api/v1/files/rename", {
+      method: "POST",
+      body: JSON.stringify({ provider: currentProvider(side), path: oldPath, new_path: newPath }),
+    });
+    const panel = state.panels[side];
+    const index = panel.entries.findIndex((item) => item.path === oldPath);
+    if (index >= 0) panel.entries[index] = { ...panel.entries[index], name: nextName, path: newPath, modified: new Date().toISOString() };
+    if (panel.selection.delete(oldPath)) panel.selection.add(newPath);
+    panel.entries = sortEntries(panel.entries, panel.sort);
+    updateSelectionLabel(side);
+    renderPanel(side);
+
+    // Keep tabs opened inside a renamed directory usable.
+    if (entry.is_dir) {
+      for (const tabSide of ["left", "right"]) {
+        let changed = false;
+        for (const tab of state.panels[tabSide].tabs) {
+          if (tab.provider !== currentProvider(side)) continue;
+          if (tab.path === oldPath || tab.path.startsWith(`${oldPath}/`)) {
+            tab.path = newPath + tab.path.slice(oldPath.length);
+            changed = true;
+          }
+        }
+        if (changed) { renderTabs(tabSide); loadPanel(tabSide); }
+      }
+      saveWorkspace();
+    }
+    toast(`已重命名为“${nextName}”`);
   } catch (error) { toast(error.message, "error"); }
 }
 
 async function createDirectory(side) {
-  const name = prompt("目录名称"); if (!name) return;
+  const name = prompt("目录名称")?.trim(); if (!name) return;
+  if (name === "." || name === ".." || /[\\/]/.test(name)) {
+    toast("目录名称不能包含 / 或 \\，也不能是 . 或 ..", "error");
+    return;
+  }
+  const directoryPath = joinPath(currentPath(side), name);
   try {
-    await api("/api/v1/files/mkdir", { method: "POST", body: JSON.stringify({ provider: currentProvider(side), path: joinPath(currentPath(side), name) }) });
-    await loadPanel(side);
+    await api("/api/v1/files/mkdir", { method: "POST", body: JSON.stringify({ provider: currentProvider(side), path: directoryPath }) });
+    upsertPanelEntry(side, {
+      name, path: directoryPath, size: 0, mode: "drwxr-xr-x",
+      modified: new Date().toISOString(), is_dir: true, is_link: false,
+    });
+    toast(`目录“${name}”已创建`);
   } catch (error) { toast(error.message, "error"); }
 }
 
@@ -796,11 +912,12 @@ async function copyEntryURL(side, entry) {
 function showFileMenu(event, side, entry) {
   const provider = providerByID(currentProvider(side));
   const selection = selectedEntries(side);
-  const transferLabel = selection.length > 1
+  const selected = selection.length ? selection : [entry];
+  const transferLabel = selected.length > 1
     ? `${side === "left" ? "上传" : "下载"}选中的 ${selection.length} 项`
     : side === "left" ? "上传到右侧" : "下载到左侧";
   const items = [
-    { label: transferLabel, action: () => transferEntries(side, side === "left" ? "right" : "left", selection) },
+    { label: transferLabel, action: () => transferEntries(side, side === "left" ? "right" : "left", selected) },
     { label: "打开", action: () => openEntry(side, state.panels[side].entries.indexOf(entry)) },
     { separator: true },
     { label: "复制路径", action: () => copyText(entryDisplayPath(side, entry), "路径已复制") },
@@ -808,7 +925,8 @@ function showFileMenu(event, side, entry) {
   if (["ftp", "sftp"].includes(provider?.kind)) items.push({ label: "复制 URL", action: () => copyEntryURL(side, entry) });
   items.push(
     { separator: true },
-    { label: "删除", danger: true, action: () => deleteEntry(side, entry) },
+    ...(selected.length === 1 ? [{ label: "重命名", action: () => renameEntry(side, selected[0]) }] : []),
+    { label: selected.length > 1 ? `删除选中的 ${selected.length} 项` : "删除", danger: true, action: () => deleteEntries(side, selected) },
     { separator: true },
     { label: "新增目录", action: () => createDirectory(side) },
     { label: "新增文件", action: () => createFile(side) },
@@ -1619,11 +1737,46 @@ function refreshTasks(tasks) {
   for (const task of tasks) {
     const previous = state.taskStatus.get(task.id);
     if (task.status === "completed" && previous && previous !== "completed") {
-      for (const side of ["left", "right"]) if (currentProvider(side) === task.target_provider) loadPanel(side);
+      appendCompletedEntry(task);
     }
     state.taskStatus.set(task.id, task.status);
   }
   renderTaskList();
+}
+
+// A completed transfer changes only one directory entry. Re-reading the
+// entire remote directory for every completed file causes a large batch to
+// keep resetting the loading view, and a slow LIST request can hide files
+// that have already arrived. Update the visible target directory in place.
+function appendCompletedEntry(task) {
+  const targetPath = task.target_path || "";
+  const name = targetPath.split("/").filter(Boolean).pop();
+  if (!name) return;
+  const parent = parentPath(targetPath);
+  for (const side of ["left", "right"]) {
+    const tab = currentTab(side);
+    if (!tab || tab.provider !== task.target_provider || tab.path !== parent) continue;
+    upsertPanelEntry(side, {
+      name,
+      path: targetPath,
+      size: task.size || 0,
+      mode: "-rw-r--r--",
+      modified: task.updated_at || new Date().toISOString(),
+      is_dir: false,
+      is_link: false,
+    });
+  }
+}
+
+function upsertPanelEntry(side, entry) {
+  const panel = state.panels[side];
+  const index = panel.entries.findIndex((item) => item.path === entry.path);
+  if (index >= 0) panel.entries[index] = { ...panel.entries[index], ...entry };
+  else panel.entries.push(entry);
+  panel.entries = sortEntries(panel.entries, panel.sort);
+  panelElements(side).count.textContent = `${panel.entries.length.toLocaleString()} 项`;
+  updateSelectionLabel(side);
+  renderPanel(side);
 }
 
 function updateTransferMetric(task, sampledAt) {
@@ -2449,6 +2602,17 @@ document.addEventListener("keydown", (event) => {
   }
   if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
   if (event.target.closest("input, textarea, select, [contenteditable='true'], dialog")) return;
+  const selection = selectedEntries(state.activePane);
+  if (event.key === "Delete" && selection.length) {
+    event.preventDefault();
+    deleteEntries(state.activePane, selection);
+    return;
+  }
+  if (event.key === "F2" && selection.length === 1) {
+    event.preventDefault();
+    renameEntry(state.activePane, selection[0]);
+    return;
+  }
   if (locateEntryByKey(state.activePane, event.key)) event.preventDefault();
 });
 window.addEventListener("blur", () => { hideContextMenu(); hideLocalTree(); hideBookmarkMenu(); hideTerminalMenu(); });

@@ -66,6 +66,12 @@ type RangeSHA256Verifier interface {
 	SHA256Range(path string, offset, length int64) ([]byte, error)
 }
 
+// AtomicReplacer promotes a fully written temporary file over its destination
+// without exposing a window where the destination is missing.
+type AtomicReplacer interface {
+	Replace(oldPath, newPath string) error
+}
+
 type FileSystem interface {
 	ID() string
 	Name() string
@@ -86,10 +92,14 @@ type FileSystem interface {
 }
 
 type ProviderInfo struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Kind      string `json:"kind"`
-	Group     string `json:"group"`
-	Location  string `json:"location,omitempty"`
-	Connected bool   `json:"connected"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Kind       string `json:"kind"`
+	Group      string `json:"group"`
+	Location   string `json:"location,omitempty"`
+	Host       string `json:"host,omitempty"`
+	Port       int    `json:"port,omitempty"`
+	User       string `json:"user,omitempty"`
+	AuthMethod string `json:"auth_method,omitempty"`
+	Connected  bool   `json:"connected"`
 }
