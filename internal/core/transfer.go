@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -32,31 +33,79 @@ type BlockState struct {
 }
 
 type TransferTask struct {
-	ID               string       `json:"id"`
-	SourceProvider   string       `json:"source_provider"`
-	SourcePath       string       `json:"source_path"`
-	TargetProvider   string       `json:"target_provider"`
-	TargetPath       string       `json:"target_path"`
-	PartPath         string       `json:"part_path"`
-	Size             int64        `json:"size"`
-	SourceModified   time.Time    `json:"source_modified"`
-	BlockSize        int64        `json:"block_size"`
-	Concurrency      int          `json:"concurrency"`
-	BytesVerified    int64        `json:"bytes_verified"`
-	BytesTransferred int64        `json:"bytes_transferred"`
-	Status           string       `json:"status"`
-	Error            string       `json:"error,omitempty"`
-	CreatedAt        time.Time    `json:"created_at"`
-	UpdatedAt        time.Time    `json:"updated_at"`
-	Blocks           []BlockState `json:"blocks,omitempty"`
+	ID               string    `json:"id"`
+	SourceProvider   string    `json:"source_provider"`
+	SourcePath       string    `json:"source_path"`
+	TargetProvider   string    `json:"target_provider"`
+	TargetPath       string    `json:"target_path"`
+	PartPath         string    `json:"part_path"`
+	Size             int64     `json:"size"`
+	SourceModified   time.Time `json:"source_modified"`
+	BlockSize        int64     `json:"block_size"`
+	Concurrency      int       `json:"concurrency"`
+	ConflictPolicy   string    `json:"conflict_policy"`
+	Verify           bool      `json:"verify"`
+	BytesVerified    int64     `json:"bytes_verified"`
+	BytesTransferred int64     `json:"bytes_transferred"`
+	// Cumulative physical I/O counters used for queue read/write throughput.
+	// They intentionally include bytes read or written again during retries.
+	BytesRead    int64        `json:"bytes_read"`
+	BytesWritten int64        `json:"bytes_written"`
+	Status       string       `json:"status"`
+	Error        string       `json:"error,omitempty"`
+	CreatedAt    time.Time    `json:"created_at"`
+	UpdatedAt    time.Time    `json:"updated_at"`
+	Blocks       []BlockState `json:"blocks,omitempty"`
 }
 
 type TransferRequest struct {
-	SourceProvider string `json:"source_provider"`
-	SourcePath     string `json:"source_path"`
-	TargetProvider string `json:"target_provider"`
-	TargetPath     string `json:"target_path"`
-	Concurrency    int    `json:"concurrency"`
+	SourceProvider    string `json:"source_provider"`
+	SourcePath        string `json:"source_path"`
+	TargetProvider    string `json:"target_provider"`
+	TargetPath        string `json:"target_path"`
+	Concurrency       int    `json:"concurrency"`
+	ConflictPolicy    string `json:"conflict_policy"`
+	Verify            *bool  `json:"verify,omitempty"`
+	PreserveStructure *bool  `json:"preserve_structure,omitempty"`
+	Filter            string `json:"filter,omitempty"`
+}
+
+const (
+	ConflictOverwrite = "overwrite"
+	ConflictSkip      = "skip"
+	ConflictIfNewer   = "if-newer"
+	ConflictRename    = "rename"
+	ConflictAsk       = "ask"
+)
+
+// TransferConflictError is returned before any target bytes are written when
+// the selected policy requires a user decision.
+type TransferConflictError struct {
+	SourcePath string
+	TargetPath string
+}
+
+func (e *TransferConflictError) Error() string {
+	return fmt.Sprintf("target already exists: %s", e.TargetPath)
+}
+
+func normalizeConflictPolicy(policy string) (string, error) {
+	policy = strings.ToLower(strings.TrimSpace(policy))
+	if policy == "" {
+		return ConflictOverwrite, nil
+	}
+	switch policy {
+	case ConflictOverwrite, ConflictSkip, ConflictIfNewer, ConflictRename, ConflictAsk:
+		return policy, nil
+	default:
+		return "", fmt.Errorf("unsupported conflict policy %q", policy)
+	}
+}
+
+// NormalizeConflictPolicy validates a policy for API/template inputs and
+// returns the default overwrite policy when omitted.
+func NormalizeConflictPolicy(policy string) (string, error) {
+	return normalizeConflictPolicy(policy)
 }
 
 type transferRun struct {
@@ -135,12 +184,24 @@ func (e *TransferEngine) load() {
 		return
 	}
 	for _, task := range tasks {
+		// Older task files predate the flag; retain the integrity-first default
+		// when loading them (an explicitly disabled check may be rechecked after
+		// an application restart).
+		if !task.Verify {
+			task.Verify = true
+		}
 		if task.Status == "running" || task.Status == "verifying" {
 			task.Status = "paused"
 			task.Error = "application restarted; resume to continue"
 		}
 		if task.BytesTransferred < task.BytesVerified {
 			task.BytesTransferred = task.BytesVerified
+		}
+		if task.BytesWritten < task.BytesTransferred {
+			task.BytesWritten = task.BytesTransferred
+		}
+		if task.BytesRead < task.BytesTransferred {
+			task.BytesRead = task.BytesTransferred
 		}
 		e.tasks[task.ID] = task
 		for _, block := range task.Blocks {
@@ -245,6 +306,14 @@ func (e *TransferEngine) Create(req TransferRequest) (TransferTask, error) {
 	if info.IsDir {
 		return TransferTask{}, errors.New("source path is a directory")
 	}
+	policy, err := normalizeConflictPolicy(req.ConflictPolicy)
+	if err != nil {
+		return TransferTask{}, err
+	}
+	actualTargetPath, skip, err := resolveConflict(target, info, req.SourcePath, req.TargetPath, policy)
+	if err != nil {
+		return TransferTask{}, err
+	}
 	if req.Concurrency < 1 {
 		req.Concurrency = 4
 	}
@@ -266,7 +335,7 @@ func (e *TransferEngine) Create(req TransferRequest) (TransferTask, error) {
 	// Some SFTP deployments hide a temporary path after its write handle closes
 	// or reject a rename from the transfer channel. Keep their proven direct
 	// path mode; local and FTP providers use isolated task temporary files.
-	partPath := req.TargetPath
+	partPath := actualTargetPath
 	if target.Kind() != "sftp" {
 		partPath += ".floe-part-" + taskID
 	}
@@ -277,7 +346,7 @@ func (e *TransferEngine) Create(req TransferRequest) (TransferTask, error) {
 	// so two concurrent HTTP requests cannot pass this check together.
 	e.mu.Lock()
 	for _, existing := range e.tasks {
-		if existing.TargetProvider == req.TargetProvider && existing.TargetPath == req.TargetPath &&
+		if existing.TargetProvider == req.TargetProvider && existing.TargetPath == actualTargetPath &&
 			existing.Status != "completed" && existing.Status != "failed" {
 			snapshot := cloneTask(existing)
 			e.mu.Unlock()
@@ -287,7 +356,7 @@ func (e *TransferEngine) Create(req TransferRequest) (TransferTask, error) {
 	// FTP creates the STOR target from the worker while holding its global
 	// write slot. Pre-opening it here would overlap another task's data
 	// connection and causes EOF on servers with a low per-user connection cap.
-	if target.Kind() != "ftp" {
+	if !skip && target.Kind() != "ftp" {
 		w, err := target.OpenWrite(partPath, &zero)
 		if err != nil {
 			e.mu.Unlock()
@@ -309,16 +378,86 @@ func (e *TransferEngine) Create(req TransferRequest) (TransferTask, error) {
 	}
 	task := &TransferTask{
 		ID: taskID, SourceProvider: req.SourceProvider,
-		SourcePath: req.SourcePath, TargetProvider: req.TargetProvider, TargetPath: req.TargetPath,
+		SourcePath: req.SourcePath, TargetProvider: req.TargetProvider, TargetPath: actualTargetPath,
 		PartPath: partPath, Size: info.Size, SourceModified: info.Modified, BlockSize: blockSize,
-		Concurrency: req.Concurrency, Status: "running", CreatedAt: now, UpdatedAt: now, Blocks: blocks,
+		Concurrency: req.Concurrency, ConflictPolicy: policy, Verify: req.Verify == nil || *req.Verify,
+		Status: "running", CreatedAt: now, UpdatedAt: now, Blocks: blocks,
+	}
+	if skip {
+		task.Status = "skipped"
+		task.Error = "目标已存在，按冲突策略跳过"
+		task.PartPath = ""
 	}
 	e.tasks[task.ID] = task
 	e.saveLocked()
 	e.notifyLocked()
 	e.mu.Unlock()
-	e.start(task.ID)
+	if !skip {
+		e.start(task.ID)
+	}
 	return cloneTask(task), nil
+}
+
+func resolveConflict(target FileSystem, source FileInfo, sourcePath, targetPath, policy string) (string, bool, error) {
+	info, err := target.Stat(targetPath)
+	exists := err == nil
+	if err != nil {
+		missing, missingErr := pathMissing(target, targetPath)
+		if missingErr != nil {
+			return "", false, fmt.Errorf("inspect target: %w", err)
+		}
+		exists = !missing
+	}
+	if !exists {
+		return targetPath, false, nil
+	}
+	switch policy {
+	case ConflictOverwrite:
+		return targetPath, false, nil
+	case ConflictSkip:
+		return targetPath, true, nil
+	case ConflictIfNewer:
+		if source.Modified.After(info.Modified) {
+			return targetPath, false, nil
+		}
+		return targetPath, true, nil
+	case ConflictRename:
+		return uniqueTargetPath(target, targetPath)
+	case ConflictAsk:
+		return "", false, &TransferConflictError{SourcePath: sourcePath, TargetPath: targetPath}
+	default:
+		return "", false, fmt.Errorf("unsupported conflict policy %q", policy)
+	}
+}
+
+// ResolveConflict applies the same policy used by file tasks to a directory
+// destination before the server starts walking its children.
+func ResolveConflict(target FileSystem, source FileInfo, sourcePath, targetPath, policy string) (string, bool, error) {
+	normalized, err := normalizeConflictPolicy(policy)
+	if err != nil {
+		return "", false, err
+	}
+	return resolveConflict(target, source, sourcePath, targetPath, normalized)
+}
+
+func uniqueTargetPath(target FileSystem, original string) (string, bool, error) {
+	directory, filename := path.Dir(original), path.Base(original)
+	extension := path.Ext(filename)
+	stem := strings.TrimSuffix(filename, extension)
+	for index := 1; index <= 10000; index++ {
+		candidate := path.Join(directory, fmt.Sprintf("%s (%d)%s", stem, index, extension))
+		_, err := target.Stat(candidate)
+		if err != nil {
+			missing, missingErr := pathMissing(target, candidate)
+			if missingErr != nil {
+				return "", false, fmt.Errorf("inspect renamed target: %w", err)
+			}
+			if missing {
+				return candidate, false, nil
+			}
+		}
+	}
+	return "", false, errors.New("无法生成不冲突的目标文件名")
 }
 
 func (e *TransferEngine) start(id string) {
@@ -458,7 +597,7 @@ func (e *TransferEngine) Clear(status string) (int, error) {
 	}
 	cleanups := make([]cleanup, 0)
 	for id, task := range e.tasks {
-		if task.Status != status {
+		if task.Status != status && !(status == "completed" && task.Status == "skipped") {
 			continue
 		}
 		run := e.runs[id]
@@ -611,7 +750,7 @@ func (e *TransferEngine) run(ctx context.Context, id string) {
 		wg.Add(1)
 		go func(jobs <-chan BlockState) {
 			defer wg.Done()
-			if err := e.worker(workerCtx, id, source, target, task.SourcePath, task.PartPath, jobs); err != nil && !errors.Is(err, context.Canceled) {
+			if err := e.worker(workerCtx, id, source, target, task.SourcePath, task.PartPath, task.Verify, jobs); err != nil && !errors.Is(err, context.Canceled) {
 				select {
 				case errCh <- err:
 					cancelWorkers()
@@ -842,7 +981,7 @@ func (r *lazyReadAtCloser) Close() error {
 	return r.reader.Close()
 }
 
-func (e *TransferEngine) worker(ctx context.Context, id string, source, target FileSystem, sourcePath, partPath string, jobs <-chan BlockState) error {
+func (e *TransferEngine) worker(ctx context.Context, id string, source, target FileSystem, sourcePath, partPath string, verifyBlocks bool, jobs <-chan BlockState) error {
 	releaseSlot, err := e.acquireTransferSlot(ctx, target.ID())
 	if err != nil {
 		return err
@@ -881,16 +1020,20 @@ func (e *TransferEngine) worker(ctx context.Context, id string, source, target F
 		var digest string
 		var transferErr error
 		for attempt := 1; attempt <= 3; attempt++ {
-			var sent, reported int64
-			digest, transferErr = writeBlockProgress(ctx, src, dst, block, func(count int64) {
-				sent += count
-				if sent-reported >= progressStep {
-					e.addTransferred(id, sent-reported)
+			var sent, reported, read, written, reportedRead, reportedWritten int64
+			digest, transferErr = writeBlockProgressStats(ctx, src, dst, block, func(readDelta, writtenDelta int64) {
+				read += readDelta
+				written += writtenDelta
+				sent += writtenDelta
+				if read-reportedRead >= progressStep || written-reportedWritten >= progressStep {
+					e.addProgress(id, sent-reported, read-reportedRead, written-reportedWritten)
 					reported = sent
+					reportedRead = read
+					reportedWritten = written
 				}
 			})
-			if sent > reported {
-				e.addTransferred(id, sent-reported)
+			if sent > reported || read > reportedRead || written > reportedWritten {
+				e.addProgress(id, sent-reported, read-reportedRead, written-reportedWritten)
 			}
 			if transferErr == nil {
 				break
@@ -913,6 +1056,17 @@ func (e *TransferEngine) worker(ctx context.Context, id string, source, target F
 				task.Blocks[block.Index].SHA256 = block.SHA256
 			}
 		})
+	}
+	if !verifyBlocks {
+		for _, block := range written {
+			e.update(id, func(task *TransferTask) {
+				if !task.Blocks[block.Index].Verified {
+					task.Blocks[block.Index].Verified = true
+					task.BytesVerified += block.Length
+				}
+			})
+		}
+		return nil
 	}
 
 	verify := newLazyVerifier(target, partPath)
@@ -974,9 +1128,9 @@ func (e *TransferEngine) rewriteBlock(ctx context.Context, id string, source io.
 		return fmt.Errorf("reopen target for repair: %w", err)
 	}
 	var sent int64
-	digest, writeErr := writeBlockProgress(ctx, source, destination, block, func(count int64) {
-		sent += count
-		e.addTransferred(id, count)
+	digest, writeErr := writeBlockProgressStats(ctx, source, destination, block, func(read, written int64) {
+		sent += written
+		e.addProgress(id, written, read, written)
 	})
 	closeErr := destination.Close()
 	if writeErr != nil || closeErr != nil {
@@ -990,6 +1144,14 @@ func (e *TransferEngine) rewriteBlock(ctx context.Context, id string, source io.
 }
 
 func writeBlockProgress(ctx context.Context, src io.ReaderAt, dst io.WriterAt, block BlockState, progress func(int64)) (string, error) {
+	return writeBlockProgressStats(ctx, src, dst, block, func(_, written int64) {
+		if progress != nil {
+			progress(written)
+		}
+	})
+}
+
+func writeBlockProgressStats(ctx context.Context, src io.ReaderAt, dst io.WriterAt, block BlockState, progress func(read, written int64)) (string, error) {
 	buf := transferBuffer(block.Length)
 	sourceHash := sha256.New()
 	remaining := block.Length
@@ -1006,12 +1168,15 @@ func writeBlockProgress(ctx context.Context, src io.ReaderAt, dst io.WriterAt, b
 		if err := readFullAt(src, chunk, offset); err != nil {
 			return "", err
 		}
+		if progress != nil {
+			progress(count, 0)
+		}
 		_, _ = sourceHash.Write(chunk)
 		if err := writeFullAt(dst, chunk, offset); err != nil {
 			return "", err
 		}
 		if progress != nil {
-			progress(count)
+			progress(0, count)
 		}
 		offset += count
 		remaining -= count
@@ -1093,15 +1258,21 @@ func transferBlockProgress(ctx context.Context, src io.ReaderAt, dst io.WriterAt
 }
 
 func (e *TransferEngine) addTransferred(id string, delta int64) {
+	e.addProgress(id, delta, 0, 0)
+}
+
+func (e *TransferEngine) addProgress(id string, transferredDelta, readDelta, writtenDelta int64) {
 	e.mu.Lock()
 	if task := e.tasks[id]; task != nil {
-		task.BytesTransferred += delta
+		task.BytesTransferred += transferredDelta
 		if task.BytesTransferred < task.BytesVerified {
 			task.BytesTransferred = task.BytesVerified
 		}
 		if task.BytesTransferred > task.Size {
 			task.BytesTransferred = task.Size
 		}
+		task.BytesRead += readDelta
+		task.BytesWritten += writtenDelta
 		task.UpdatedAt = time.Now()
 		e.notifyLocked()
 	}

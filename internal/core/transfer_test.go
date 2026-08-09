@@ -235,12 +235,68 @@ func TestEngineCopiesLocalFileAndPersistsVerifiedTask(t *testing.T) {
 				if len(current.Blocks) != 1 || !current.Blocks[0].Verified || current.Blocks[0].SHA256 == "" {
 					t.Fatal("block verification state was not persisted")
 				}
+				if current.BytesRead != int64(len(content)) || current.BytesWritten != int64(len(content)) {
+					t.Fatalf("I/O counters = read %d, written %d; want %d each", current.BytesRead, current.BytesWritten, len(content))
+				}
 				return
 			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("transfer did not complete before deadline")
+}
+
+func TestTransferConflictPolicies(t *testing.T) {
+	root := t.TempDir()
+	sourceRoot, targetRoot := filepath.Join(root, "source"), filepath.Join(root, "target")
+	source, _ := NewLocalFS("source", "source", sourceRoot)
+	target, _ := NewLocalFS("target", "target", targetRoot)
+	manager := NewManager()
+	manager.Add(source)
+	manager.Add(target)
+	content := []byte("new content")
+	if err := os.WriteFile(filepath.Join(sourceRoot, "file.txt"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetRoot, "file.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	engine := NewTransferEngine(manager, filepath.Join(root, "tasks.json"))
+	skipped, err := engine.Create(TransferRequest{SourceProvider: "source", SourcePath: "/file.txt", TargetProvider: "target", TargetPath: "/file.txt", ConflictPolicy: ConflictSkip})
+	if err != nil || skipped.Status != "skipped" {
+		t.Fatalf("skip policy task = %#v, err = %v", skipped, err)
+	}
+	kept, _ := os.ReadFile(filepath.Join(targetRoot, "file.txt"))
+	if string(kept) != "keep" {
+		t.Fatalf("skip policy changed target: %q", kept)
+	}
+	rename, err := engine.Create(TransferRequest{SourceProvider: "source", SourcePath: "/file.txt", TargetProvider: "target", TargetPath: "/file.txt", ConflictPolicy: ConflictRename})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		current, ok := engine.Get(rename.ID)
+		if ok && current.Status == "completed" {
+			if current.TargetPath != "/file (1).txt" {
+				t.Fatalf("renamed target = %q", current.TargetPath)
+			}
+			got, readErr := os.ReadFile(filepath.Join(targetRoot, "file (1).txt"))
+			if readErr != nil || !bytes.Equal(got, content) {
+				t.Fatalf("renamed content = %q, err = %v", got, readErr)
+			}
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	current, _ := engine.Get(rename.ID)
+	if current.Status != "completed" {
+		t.Fatalf("rename task did not complete: %s (%s)", current.Status, current.Error)
+	}
+	var conflict *TransferConflictError
+	if _, err := engine.Create(TransferRequest{SourceProvider: "source", SourcePath: "/file.txt", TargetProvider: "target", TargetPath: "/file.txt", ConflictPolicy: ConflictAsk}); !errors.As(err, &conflict) {
+		t.Fatalf("ask policy error = %v", err)
+	}
 }
 
 func TestEngineConcurrentCreatesUseUniqueTaskIDs(t *testing.T) {

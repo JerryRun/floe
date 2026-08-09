@@ -37,6 +37,7 @@ type Server struct {
 	manager         *core.Manager
 	sessionStore    *sessionStore
 	bookmarks       *bookmarkStore
+	templates       *transferTemplateStore
 	transfers       *core.TransferEngine
 	connectProvider func(core.ConnectRequest) (core.ProviderInfo, error)
 	activity        *activityLog
@@ -66,9 +67,14 @@ func New(dataDir string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	templates, err := newTransferTemplateStore(dataDir)
+	if err != nil {
+		return nil, err
+	}
 	server := &Server{
 		dataDir: dataDir, manager: manager, sessionStore: sessionStore,
 		bookmarks:       bookmarks,
+		templates:       templates,
 		transfers:       core.NewTransferEngine(manager, filepath.Join(dataDir, "tasks.json")),
 		connectProvider: manager.Connect,
 		activity:        newActivityLog(dataDir),
@@ -278,6 +284,14 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		s.createLocalTab(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/transfers":
 		s.createTransfer(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/transfer-templates":
+		writeJSON(w, http.StatusOK, s.templates.List())
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/transfer-templates":
+		s.saveTransferTemplate(w, r)
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/v1/transfer-templates/"):
+		s.deleteTransferTemplate(w, r)
+	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/run") && strings.HasPrefix(r.URL.Path, "/api/v1/transfer-templates/"):
+		s.runTransferTemplate(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/transfers":
 		s.listTransfers(w)
 	case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/transfers":
@@ -896,6 +910,11 @@ func (s *Server) createTransfer(w http.ResponseWriter, r *http.Request) {
 		tasks := make([]core.TransferTask, 0)
 		if err := s.enqueueDirectory(source, target, req, &tasks, 2000); err != nil {
 			s.activity.Add("error", "transfer", "目录传输创建失败", err.Error())
+			var conflict *core.TransferConflictError
+			if errors.As(err, &conflict) {
+				s.writeTransferConflict(w, source, target, conflict)
+				return
+			}
 			writeError(w, http.StatusBadRequest, "TRANSFER_FAILED", "无法创建目录传输任务", err.Error())
 			return
 		}
@@ -909,6 +928,11 @@ func (s *Server) createTransfer(w http.ResponseWriter, r *http.Request) {
 	task, err := s.transfers.Create(req)
 	if err != nil {
 		s.activity.Add("error", "transfer", "传输任务创建失败", err.Error())
+		var conflict *core.TransferConflictError
+		if errors.As(err, &conflict) {
+			s.writeTransferConflict(w, source, target, conflict)
+			return
+		}
 		writeError(w, http.StatusBadRequest, "TRANSFER_FAILED", "无法创建传输任务", err.Error())
 		return
 	}
@@ -917,12 +941,115 @@ func (s *Server) createTransfer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, task)
 }
 
+func (s *Server) writeTransferConflict(w http.ResponseWriter, source, target core.FileSystem, conflict *core.TransferConflictError) {
+	payload := map[string]any{
+		"code": "TRANSFER_CONFLICT", "message": "目标已存在",
+		"source_path": conflict.SourcePath, "target_path": conflict.TargetPath,
+	}
+	if info, err := source.Stat(conflict.SourcePath); err == nil {
+		payload["source"] = map[string]any{"path": conflict.SourcePath, "name": filepath.Base(conflict.SourcePath), "size": info.Size, "modified": info.Modified}
+	}
+	if info, err := target.Stat(conflict.TargetPath); err == nil {
+		payload["target"] = map[string]any{"path": conflict.TargetPath, "name": filepath.Base(conflict.TargetPath), "size": info.Size, "modified": info.Modified}
+	}
+	writeJSON(w, http.StatusConflict, payload)
+}
+
+func (s *Server) saveTransferTemplate(w http.ResponseWriter, r *http.Request) {
+	var item TransferTemplate
+	if !decodeJSON(w, r, &item) {
+		return
+	}
+	policy, err := core.NormalizeConflictPolicy(item.ConflictPolicy)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "TEMPLATE_INVALID", "冲突策略无效", err.Error())
+		return
+	}
+	item.ConflictPolicy = policy
+	saved, err := s.templates.Save(item)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "TEMPLATE_SAVE_FAILED", "保存传输模板失败", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, saved)
+}
+
+func (s *Server) deleteTransferTemplate(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/v1/transfer-templates/")
+	if id == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusNotFound, "TEMPLATE_NOT_FOUND", "模板不存在", "")
+		return
+	}
+	if err := s.templates.Delete(id); err != nil {
+		writeError(w, http.StatusNotFound, "TEMPLATE_NOT_FOUND", "模板不存在", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) runTransferTemplate(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/transfer-templates/"), "/run")
+	template, ok := s.templates.Get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "TEMPLATE_NOT_FOUND", "模板不存在", "")
+		return
+	}
+	tasks := make([]core.TransferTask, 0, len(template.Tasks))
+	failures := make([]string, 0)
+	for _, item := range template.Tasks {
+		verify := item.Verify
+		request := core.TransferRequest{
+			SourceProvider: item.SourceProvider, SourcePath: item.SourcePath,
+			TargetProvider: item.TargetProvider, TargetPath: item.TargetPath,
+			Concurrency: item.Concurrency, ConflictPolicy: item.ConflictPolicy,
+			Verify: &verify, Filter: item.Filter,
+		}
+		preserve := item.PreserveStructure
+		request.PreserveStructure = &preserve
+		task, err := s.transfers.Create(request)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s → %s: %v", item.SourcePath, item.TargetPath, err))
+			continue
+		}
+		task.Blocks = nil
+		tasks = append(tasks, task)
+	}
+	status := http.StatusCreated
+	if len(tasks) == 0 && len(failures) > 0 {
+		status = http.StatusBadRequest
+	}
+	writeJSON(w, status, map[string]any{"tasks": tasks, "started": len(tasks), "failed": failures})
+}
+
 func (s *Server) enqueueDirectory(source, target core.FileSystem, req core.TransferRequest, tasks *[]core.TransferTask, limit int) error {
+	return s.enqueueDirectoryWalk(source, target, req, tasks, limit, true)
+}
+
+func (s *Server) enqueueDirectoryWalk(source, target core.FileSystem, req core.TransferRequest, tasks *[]core.TransferTask, limit int, ensureTarget bool) error {
 	if len(*tasks) >= limit {
 		return fmt.Errorf("目录中文件超过 %d 个限制", limit)
 	}
-	if err := target.Mkdir(req.TargetPath); err != nil {
+	info, err := source.Stat(req.SourcePath)
+	if err != nil {
 		return err
+	}
+	preserveStructure := req.PreserveStructure == nil || *req.PreserveStructure
+	if ensureTarget {
+		resolved, skip, err := core.ResolveConflict(target, info, req.SourcePath, req.TargetPath, req.ConflictPolicy)
+		if err != nil {
+			return err
+		}
+		req.TargetPath = resolved
+		if !skip {
+			if existing, statErr := target.Stat(req.TargetPath); statErr == nil && existing.IsDir {
+				// Reuse an existing directory; its children are handled by their
+				// own conflict policy below.
+			} else if statErr == nil {
+				return fmt.Errorf("目标路径已存在且不是目录: %s", req.TargetPath)
+			} else if err := target.Mkdir(req.TargetPath); err != nil {
+				return err
+			}
+		}
 	}
 	entries, err := source.List(req.SourcePath)
 	if err != nil {
@@ -936,10 +1063,20 @@ func (s *Server) enqueueDirectory(source, target core.FileSystem, req core.Trans
 		child.SourcePath = path.Join(req.SourcePath, entry.Name)
 		child.TargetPath = path.Join(req.TargetPath, entry.Name)
 		if entry.IsDir {
-			if err := s.enqueueDirectory(source, target, child, tasks, limit); err != nil {
+			if !preserveStructure {
+				child.TargetPath = req.TargetPath
+			}
+			if err := s.enqueueDirectoryWalk(source, target, child, tasks, limit, preserveStructure); err != nil {
 				return err
 			}
 			continue
+		}
+		relative := strings.TrimPrefix(child.SourcePath, strings.TrimSuffix(req.SourcePath, "/")+"/")
+		if !matchesTransferFilter(relative, req.Filter) {
+			continue
+		}
+		if !preserveStructure {
+			child.TargetPath = path.Join(req.TargetPath, entry.Name)
 		}
 		if len(*tasks) >= limit {
 			return fmt.Errorf("目录中文件超过 %d 个限制", limit)
@@ -954,6 +1091,38 @@ func (s *Server) enqueueDirectory(source, target core.FileSystem, req core.Trans
 		*tasks = append(*tasks, task)
 	}
 	return nil
+}
+
+func matchesTransferFilter(relative, filter string) bool {
+	patterns := strings.FieldsFunc(filter, func(r rune) bool { return r == '\n' || r == '\r' || r == ',' || r == ';' })
+	if len(patterns) == 0 {
+		return true
+	}
+	included := false
+	hasInclude := false
+	for _, raw := range patterns {
+		pattern := strings.TrimSpace(raw)
+		if pattern == "" {
+			continue
+		}
+		exclude := strings.HasPrefix(pattern, "!")
+		if exclude {
+			pattern = strings.TrimSpace(strings.TrimPrefix(pattern, "!"))
+		} else {
+			hasInclude = true
+		}
+		matched, _ := path.Match(pattern, relative)
+		if !matched {
+			matched, _ = path.Match(pattern, path.Base(relative))
+		}
+		if matched && exclude {
+			return false
+		}
+		if matched && !exclude {
+			included = true
+		}
+	}
+	return included || !hasInclude
 }
 
 func (s *Server) listTransfers(w http.ResponseWriter) {

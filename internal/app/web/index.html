@@ -14,8 +14,18 @@
       <div class="sidebar-brand">
         <div class="brand"><img src="/assets/floe-64.png?v=3" alt=""><span>Floe</span></div>
       </div>
+      <div class="sidebar-tabs" role="tablist" aria-label="侧栏视图">
+        <button type="button" class="sidebar-tab active" data-sidebar-tab="sessions" role="tab" aria-selected="true">服务器</button>
+        <button type="button" class="sidebar-tab" data-sidebar-tab="publishes" role="tab" aria-selected="false">发布任务 <span id="publishTaskCount"></span></button>
+      </div>
       <div class="session-search"><span class="material-symbols-rounded" aria-hidden="true">search</span><input id="sessionSearch" placeholder="搜索会话"><button id="sidebarAdd" title="添加会话" aria-label="添加会话"><span class="material-symbols-rounded" aria-hidden="true">add</span></button></div>
-      <div class="session-tree" id="sessionTree"></div>
+      <div class="sidebar-content">
+        <div class="session-tree" id="sessionTree"></div>
+        <div class="publish-task-pane" id="publishTaskPane" hidden>
+          <div class="publish-task-list" id="publishTaskList"></div>
+        </div>
+        <div class="publish-task-details" id="publishTaskDetails" hidden></div>
+      </div>
     </aside>
 
     <main class="main-area">
@@ -189,6 +199,44 @@
     </div>
     <div class="media-stage"><video id="mediaPlayer" controls playsinline></video><div id="mediaMessage"></div></div>
     <div class="media-foot"><span id="mediaState">准备播放</span></div>
+  </dialog>
+
+  <dialog id="transferOptionsDialog" class="dialog transfer-options-dialog">
+    <form id="transferOptionsForm">
+      <div class="dialog-title"><h2>处理文件冲突</h2><button type="button" id="transferOptionsClose" aria-label="关闭"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></div>
+      <div class="form-grid">
+        <div class="wide conflict-file-compare" id="transferConflictSummary"></div>
+        <div class="wide conflict-action-list" id="conflictActionList" role="listbox" aria-label="冲突处理方式">
+          <button type="button" data-conflict-policy="overwrite" role="option">覆盖</button>
+          <button type="button" data-conflict-policy="skip" role="option">跳过已存在</button>
+          <button type="button" data-conflict-policy="if-newer" role="option">仅源文件更新时覆盖</button>
+          <button type="button" data-conflict-policy="rename" role="option">自动重命名</button>
+        </div>
+        <label class="wide keepalive-toggle"><input name="always" type="checkbox"><span>本批次后续冲突都使用该操作</span></label>
+      </div>
+      <div class="dialog-actions"><button type="button" id="transferOptionsCancel">跳过此文件</button><button type="submit" class="primary">继续处理</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="publishTemplateDialog" class="dialog publish-template-dialog">
+    <form id="publishTemplateForm">
+      <div class="dialog-title"><h2>编辑发布任务</h2><button type="button" id="publishTemplateClose" aria-label="关闭"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></div>
+      <div class="form-grid publish-template-form-grid">
+        <label class="wide">任务名称<input name="name" required></label>
+        <div class="wide publish-editor-items" id="publishTemplateItems"></div>
+      </div>
+      <div class="dialog-actions"><button type="button" id="publishTemplateCancel">取消</button><button type="submit" class="primary">保存</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="templateChooseDialog" class="dialog template-choose-dialog">
+    <form id="templateChooseForm">
+      <div class="dialog-title"><h2>添加到模板</h2><button type="button" id="templateChooseClose" aria-label="关闭"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></div>
+      <div class="form-grid">
+        <label class="wide">选择发布模板<select name="template"></select></label>
+      </div>
+      <div class="dialog-actions"><button type="button" id="templateChooseCancel">取消</button><button type="submit" class="primary">添加</button></div>
+    </form>
   </dialog>
 
   <div class="toast-stack" id="toastStack" aria-live="polite"></div>

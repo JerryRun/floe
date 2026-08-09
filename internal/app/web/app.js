@@ -8,7 +8,15 @@ const state = {
   bookmarks: {},
   taskStatus: new Map(),
   transferMetrics: new Map(),
+  transferTemplates: [],
+  sidebarTab: "sessions",
+  publishExpanded: new Set(),
+  editingPublishTemplate: null,
+  templateChooseResolve: null,
+  transferOptionsResolve: null,
+  transferConflictPolicy: "overwrite",
   tasks: [],
+  taskSelection: new Set(),
   logs: [],
   taskFilter: "queue",
   localTreeSide: "",
@@ -234,6 +242,173 @@ function renderSessionTree() {
     }
     group.append(head, items);
     tree.append(group);
+  }
+}
+
+function setSidebarTab(tab) {
+  state.sidebarTab = tab === "publishes" ? "publishes" : "sessions";
+  $$(".sidebar-tab").forEach((button) => {
+    const active = button.dataset.sidebarTab === state.sidebarTab;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  const sessions = state.sidebarTab === "sessions";
+  $(".session-search").hidden = !sessions;
+  $("#sessionTree").hidden = !sessions;
+  $("#publishTaskPane").hidden = sessions;
+  if (sessions) hidePublishTaskDetails();
+  if (!sessions) renderPublishSidebar();
+}
+
+function templateTasks(template) {
+  return template?.tasks?.length ? template.tasks : (template ? [template] : []);
+}
+
+function templateProviderName(id) {
+  return providerByID(id)?.name || id || "未指定";
+}
+
+function latestPublishTask(item) {
+  return [...state.tasks].reverse().find((task) => task.source_provider === item.source_provider && task.source_path === item.source_path && task.target_provider === item.target_provider && task.target_path === item.target_path);
+}
+
+function renderPublishSidebar() {
+  const list = $("#publishTaskList");
+  const count = $("#publishTaskCount");
+  if (!list) return;
+  count.textContent = state.transferTemplates.length ? `(${state.transferTemplates.length})` : "";
+  if (!state.transferTemplates.length) {
+    list.innerHTML = '<div class="publish-empty">还没有发布任务<br>在成功列表中右键保存模板</div>';
+    return;
+  }
+  list.replaceChildren(...state.transferTemplates.map((template) => {
+    const row = document.createElement("div");
+    row.className = "publish-task-row";
+    const name = document.createElement("button");
+    name.type = "button";
+    name.className = "publish-task-name";
+    name.textContent = template.name;
+    name.title = template.name;
+    name.addEventListener("focus", (event) => showPublishTaskDetails(template, event.currentTarget));
+    name.addEventListener("blur", hidePublishTaskDetails);
+    row.addEventListener("mouseenter", () => showPublishTaskDetails(template, name));
+    row.addEventListener("mouseleave", hidePublishTaskDetails);
+    const actions = document.createElement("span");
+    actions.className = "publish-task-row-actions";
+    actions.addEventListener("mouseenter", hidePublishTaskDetails);
+    const run = document.createElement("button");
+    run.type = "button";
+    run.className = "icon-button";
+    run.setAttribute("aria-label", "执行发布任务");
+    run.innerHTML = '<span class="material-symbols-rounded" aria-hidden="true">play_arrow</span>';
+    run.addEventListener("click", () => runTransferTemplate(template.id));
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "icon-button";
+    edit.setAttribute("aria-label", "编辑发布任务");
+    edit.innerHTML = '<svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 17.25V20h2.75L17.8 8.95l-2.75-2.75L4 17.25Zm15.7-9.3c.4-.4.4-1.05 0-1.45l-2.2-2.2a1.03 1.03 0 0 0-1.45 0l-1.35 1.35 2.75 2.75L19.7 7.95Z"/></svg>';
+    edit.addEventListener("click", () => openPublishTemplateEditor(template));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "icon-button danger";
+    remove.setAttribute("aria-label", "删除发布任务");
+    remove.innerHTML = '<span class="material-symbols-rounded" aria-hidden="true">delete</span>';
+    remove.addEventListener("click", () => deletePublishTemplate(template));
+    actions.append(run, edit, remove);
+    row.append(name, actions);
+    return row;
+  }));
+}
+
+function publishTaskGroups(template) {
+  const groups = new Map();
+  for (const item of templateTasks(template)) {
+    const key = `${item.source_provider}\u0000${item.target_provider}`;
+    if (!groups.has(key)) groups.set(key, { source: item.source_provider, target: item.target_provider, items: [] });
+    groups.get(key).items.push(item);
+  }
+  return [...groups.values()];
+}
+
+function publishTaskDetailsHTML(template, editable = false) {
+  const groups = publishTaskGroups(template);
+  const groupsHTML = groups.map((group) => {
+    const heading = `${templateProviderName(group.source)} -> ${templateProviderName(group.target)}:`;
+    const items = group.items.map((item) => `<div class="publish-detail-item"><span>- ${escapeHTML(item.source_path || "/")} -> ${escapeHTML(item.target_path || "/")}</span></div>`).join("");
+    return `<section class="publish-detail-group"><strong>${escapeHTML(heading)}</strong>${items}</section>`;
+  }).join("");
+  return `<div class="publish-detail-title">${escapeHTML(template.name)}</div>${groupsHTML || '<div class="publish-empty">没有发布项</div>'}`;
+}
+
+function showPublishTaskDetails(template, anchor) {
+  const details = $("#publishTaskDetails");
+  if (!details) return;
+  details.innerHTML = publishTaskDetailsHTML(template);
+  details.hidden = false;
+  const rect = anchor.getBoundingClientRect();
+  const width = Math.min(470, Math.max(300, window.innerWidth - rect.right - 14));
+  details.style.width = `${width}px`;
+  details.style.left = `${Math.min(rect.right + 8, window.innerWidth - width - 8)}px`;
+  details.style.top = `${Math.max(8, Math.min(rect.top, window.innerHeight - details.offsetHeight - 8))}px`;
+}
+
+function hidePublishTaskDetails() {
+  const details = $("#publishTaskDetails");
+  if (details) details.hidden = true;
+}
+
+function renderPublishTemplateEditor() {
+  const list = $("#publishTemplateItems");
+  const template = state.editingPublishTemplate;
+  if (!list || !template) return;
+  const tasks = template.tasks || [];
+  const groups = publishTaskGroups(template);
+  list.replaceChildren(...groups.flatMap((group) => {
+    const heading = document.createElement("div");
+    heading.className = "publish-editor-group";
+    heading.textContent = templateProviderName(group.source) + " -> " + templateProviderName(group.target) + ":";
+    return [heading, ...group.items.map((item) => {
+      const index = tasks.indexOf(item);
+      const row = document.createElement("div");
+      row.className = "publish-editor-item";
+      row.innerHTML = '<span title="' + escapeHTML((item.source_path || "/") + " -> " + (item.target_path || "/")) + '">- ' + escapeHTML(item.source_path || "/") + " -> " + escapeHTML(item.target_path || "/") + "</span>";
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "icon-button danger";
+      remove.title = "删除此发布项";
+      remove.setAttribute("aria-label", "删除此发布项");
+      remove.innerHTML = '<span class="material-symbols-rounded" aria-hidden="true">delete</span>';
+      remove.addEventListener("click", () => {
+        template.tasks.splice(index, 1);
+        renderPublishTemplateEditor();
+      });
+      row.append(remove);
+      return row;
+    })];
+  }));
+}
+
+function openPublishTemplateEditor(template) {
+  state.editingPublishTemplate = JSON.parse(JSON.stringify(template));
+  if (!Array.isArray(state.editingPublishTemplate.tasks)) {
+    const legacyTask = { ...state.editingPublishTemplate };
+    delete legacyTask.tasks;
+    state.editingPublishTemplate.tasks = [legacyTask];
+  }
+  const form = $("#publishTemplateForm");
+  form.elements.name.value = state.editingPublishTemplate.name || "";
+  renderPublishTemplateEditor();
+  $("#publishTemplateDialog").showModal();
+}
+
+async function deletePublishTemplate(template) {
+  if (!confirm("确定删除发布任务“" + template.name + "”？")) return;
+  try {
+    await api("/api/v1/transfer-templates/" + encodeURIComponent(template.id), { method: "DELETE" });
+    await loadTransferTemplates();
+    toast("已删除发布任务“" + template.name + "”");
+  } catch (error) {
+    toast(error.message, "error");
   }
 }
 
@@ -708,6 +883,57 @@ function parentPath(value) {
 }
 function joinPath(parent, name) { return `${parent === "/" ? "" : parent}/${name}`; }
 
+async function loadTransferTemplates() {
+  try {
+    state.transferTemplates = await api("/api/v1/transfer-templates");
+    for (const template of state.transferTemplates) state.publishExpanded.add(template.id);
+    renderPublishSidebar();
+  } catch (error) {
+    toast(`读取传输模板失败：${error.message}`, "error");
+  }
+}
+
+function selectedTransferOptions() {
+  return {
+    template: null,
+    concurrency: Math.max(1, Math.min(8, Number(localStorage.getItem("floe.transfer.concurrency") || 4))),
+    verify: localStorage.getItem("floe.transfer.verify") !== "false",
+    preserve_structure: localStorage.getItem("floe.transfer.preserve") !== "false",
+    filter: localStorage.getItem("floe.transfer.filter") || "",
+  };
+}
+
+function transferConflictOptions(entry, error) {
+  const dialog = $("#transferOptionsDialog");
+  const form = $("#transferOptionsForm");
+  const payload = error?.payload || {};
+  const source = payload.source || { path: entry.path, name: entry.name, size: entry.size, modified: entry.modified };
+  const target = payload.target || { path: payload.target_path || entry.name, name: payload.target_path?.split("/").pop() || entry.name };
+  const fileCard = (label, info, kind) => {
+    const size = Number.isFinite(Number(info.size)) ? formatBytes(Number(info.size)) : "未知";
+    const modified = info.modified ? formatTime(info.modified) : "未知";
+    return `<section class="conflict-file-card ${kind}"><h3>${label}</h3><div class="conflict-file-name" title="${escapeHTML(info.name || info.path || "")}">${escapeHTML(info.name || info.path || "未知文件")}</div><div class="conflict-file-path">${escapeHTML(info.path || "")}</div><div class="conflict-file-meta">大小：${size}<br>更新时间：${modified}</div></section>`;
+  };
+  $("#transferConflictSummary").innerHTML = fileCard("源文件", source, "source") + fileCard("目标文件（已存在）", target, "target");
+  state.transferConflictPolicy = "overwrite";
+  form.elements.always.checked = false;
+  $$("#conflictActionList button").forEach((button) => {
+    const selected = button.dataset.conflictPolicy === state.transferConflictPolicy;
+    button.classList.toggle("selected", selected);
+    button.setAttribute("aria-selected", String(selected));
+  });
+  dialog.showModal();
+  return new Promise((resolve) => { state.transferOptionsResolve = resolve; });
+}
+
+function closeTransferOptions(result) {
+  const dialog = $("#transferOptionsDialog");
+  if (dialog.open) dialog.close();
+  const resolve = state.transferOptionsResolve;
+  state.transferOptionsResolve = null;
+  resolve?.(result);
+}
+
 async function transferEntries(fromSide, toSide, entries) {
   const uniqueEntries = [...new Map((entries || []).map((entry) => [entry.path, entry])).values()];
   if (!uniqueEntries.length) { toast("请选择文件", "error"); return; }
@@ -716,13 +942,41 @@ async function transferEntries(fromSide, toSide, entries) {
   if (!source || !target) return;
   const transferable = uniqueEntries.filter((entry) => source.provider !== target.provider || entry.path !== joinPath(target.path, entry.name));
   if (!transferable.length) { toast("所选项目的源和目标位置相同", "error"); return; }
-  const results = await Promise.allSettled(transferable.map((entry) => api("/api/v1/transfers", {
-      method: "POST",
-      body: JSON.stringify({ source_provider: source.provider, source_path: entry.path, target_provider: target.provider, target_path: joinPath(target.path, entry.name), concurrency: 4 }),
-    })));
-    const succeeded = results.filter((result) => result.status === "fulfilled").length;
-    const failed = results.length - succeeded;
-    if (succeeded) {
+  const options = selectedTransferOptions();
+  const initialPolicy = options.template?.conflict_policy || "ask";
+  const create = (entry, policy = initialPolicy) => api("/api/v1/transfers", {
+    method: "POST",
+    body: JSON.stringify({ source_provider: source.provider, source_path: entry.path, target_provider: target.provider, target_path: joinPath(target.path, entry.name), concurrency: options.concurrency, conflict_policy: policy, verify: options.verify, preserve_structure: options.preserve_structure, filter: options.filter }),
+  });
+  const results = await Promise.allSettled(transferable.map((entry) => create(entry)));
+  // All non-conflicting files are queued immediately. Only the rejected
+  // conflict items are handled one by one so one modal never races another.
+  let batchConflictPolicy = "";
+  for (let index = 0; index < results.length; index++) {
+    const result = results[index];
+    // Treat every HTTP 409 from the transfer endpoint as a conflict. This
+    // keeps the dialog compatible with older Floe backends that only returned
+    // the status/message fields and omitted the newer error code.
+    if (result.status !== "rejected" || result.reason?.status !== 409) continue;
+    try {
+      const decision = batchConflictPolicy
+        ? { conflict_policy: batchConflictPolicy, always: true }
+        : await transferConflictOptions(transferable[index], result.reason);
+      if (!decision) {
+        results[index] = { status: "fulfilled", value: await create(transferable[index], "skip") };
+        continue;
+      }
+      if (decision.always) batchConflictPolicy = decision.conflict_policy;
+      results[index] = { status: "fulfilled", value: await create(transferable[index], decision.conflict_policy) };
+    } catch (reason) {
+      results[index] = { status: "rejected", reason };
+    }
+  }
+    const accepted = results.filter((result) => result.status === "fulfilled").length;
+    const skipped = results.filter((result) => result.status === "fulfilled" && result.value?.status === "skipped").length;
+    const started = accepted - skipped;
+    const failed = results.length - accepted;
+    if (started) {
       // Directory transfers create the destination directory before their
       // child tasks are queued. Reflect that server-side mkdir immediately;
       // individual files will be appended as their transfers complete.
@@ -750,10 +1004,13 @@ async function transferEntries(fromSide, toSide, entries) {
         const message = result.reason?.message || "创建任务失败";
         return `${transferable[index].name}: ${message}`;
       }).filter(Boolean);
-      const prefix = succeeded ? `已开始传输 ${succeeded} 项，${failed} 项失败` : "传输任务创建失败";
+      const prefix = started ? `已开始传输 ${started} 项，${failed} 项失败` : "传输任务创建失败";
       toast(`${prefix} · ${failedDetails.slice(0, 2).join("；")}${failedDetails.length > 2 ? "；…" : ""}`, "error");
-    } else {
-      toast(succeeded === 1 ? `开始传输 ${transferable[0].name}` : `已开始传输 ${succeeded} 项`);
+    } else if (started) {
+      const skippedText = skipped ? `，跳过 ${skipped} 项` : "";
+      toast(started === 1 && !skipped ? `开始传输 ${transferable.find((_, index) => results[index].status === "fulfilled" && results[index].value?.status !== "skipped")?.name || "文件"}` : `已开始传输 ${started} 项${skippedText}`);
+    } else if (skipped) {
+      toast(`已跳过 ${skipped} 项`);
     }
 }
 
@@ -923,6 +1180,18 @@ function showFileMenu(event, side, entry) {
     { label: "复制路径", action: () => copyText(entryDisplayPath(side, entry), "路径已复制") },
   ];
   if (["ftp", "sftp"].includes(provider?.kind)) items.push({ label: "复制 URL", action: () => copyEntryURL(side, entry) });
+  const templateTasks = selected.map((item) => ({
+    source_provider: currentProvider(side),
+    source_path: item.path,
+    target_provider: currentProvider(side === "left" ? "right" : "left"),
+    target_path: joinPath(currentPath(side === "left" ? "right" : "left"), item.name),
+    conflict_policy: "overwrite", concurrency: 4, verify: true, preserve_structure: true, filter: "",
+  }));
+  items.push(
+    { separator: true },
+    { label: selected.length > 1 ? "保存选中的 " + selected.length + " 项为模板…" : "保存为模板…", action: () => saveTemplateTaskSet(templateTasks) },
+    { label: "添加到模板", action: () => appendTasksToTemplate(templateTasks) },
+  );
   items.push(
     { separator: true },
     ...(selected.length === 1 ? [{ label: "重命名", action: () => renameEntry(side, selected[0]) }] : []),
@@ -1723,6 +1992,8 @@ function refreshTasks(tasks) {
   const sampledAt = Date.now();
   for (const task of tasks) updateTransferMetric(task, sampledAt);
   state.tasks = tasks;
+  const taskIDs = new Set(tasks.map((task) => task.id));
+  for (const id of state.taskSelection) if (!taskIDs.has(id)) state.taskSelection.delete(id);
   const queue = tasks.filter((task) => taskCategory(task) === "queue");
   const success = tasks.filter((task) => taskCategory(task) === "success");
   const failed = tasks.filter((task) => taskCategory(task) === "failed");
@@ -1742,6 +2013,7 @@ function refreshTasks(tasks) {
     state.taskStatus.set(task.id, task.status);
   }
   renderTaskList();
+  renderPublishSidebar();
 }
 
 // A completed transfer changes only one directory entry. Re-reading the
@@ -1781,28 +2053,45 @@ function upsertPanelEntry(side, entry) {
 
 function updateTransferMetric(task, sampledAt) {
   const bytes = Math.max(task.bytes_verified || 0, task.bytes_transferred || 0);
+  // Read/write counters are physical I/O and can differ when a provider
+  // retries a block or when verification is performed. Keep a separate
+  // smoothed rate for each direction instead of presenting one ambiguous
+  // aggregate speed.
+  const readBytes = task.bytes_read || bytes;
+  const writeBytes = task.bytes_written || bytes;
   const previous = state.transferMetrics.get(task.id);
-  let speed = previous?.speed || 0;
+  let readSpeed = previous?.readSpeed || 0;
+  let writeSpeed = previous?.writeSpeed || 0;
   if (["running", "verifying"].includes(task.status)) {
-    if (previous && bytes > previous.bytes && sampledAt > previous.sampledAt) {
-      const instantaneous = (bytes - previous.bytes) * 1000 / (sampledAt - previous.sampledAt);
-      speed = speed > 0 ? speed * 0.65 + instantaneous * 0.35 : instantaneous;
+    if (previous && sampledAt > previous.sampledAt) {
+      const elapsed = sampledAt - previous.sampledAt;
+      if (readBytes > previous.readBytes) {
+        const instantaneous = (readBytes - previous.readBytes) * 1000 / elapsed;
+        readSpeed = readSpeed > 0 ? readSpeed * 0.65 + instantaneous * 0.35 : instantaneous;
+      }
+      if (writeBytes > previous.writeBytes) {
+        const instantaneous = (writeBytes - previous.writeBytes) * 1000 / elapsed;
+        writeSpeed = writeSpeed > 0 ? writeSpeed * 0.65 + instantaneous * 0.35 : instantaneous;
+      }
     } else if (!previous && bytes > 0 && task.status === "running") {
       const elapsed = Math.max(1, (sampledAt - new Date(task.created_at).getTime()) / 1000);
-      speed = bytes / elapsed;
+      readSpeed = readBytes / elapsed;
+      writeSpeed = writeBytes / elapsed;
     }
   } else if (task.status === "completed") {
     const duration = Math.max(1, (new Date(task.updated_at).getTime() - new Date(task.created_at).getTime()) / 1000);
-    speed = task.size / duration;
+    readSpeed = readBytes / duration;
+    writeSpeed = writeBytes / duration;
   } else {
-    speed = 0;
+    readSpeed = 0;
+    writeSpeed = 0;
   }
-  const progressSampledAt = previous && bytes === previous.bytes ? previous.sampledAt : sampledAt;
-  state.transferMetrics.set(task.id, { bytes, sampledAt: progressSampledAt, speed });
+  const progressSampledAt = previous && bytes === previous.bytes && readBytes === previous.readBytes && writeBytes === previous.writeBytes ? previous.sampledAt : sampledAt;
+  state.transferMetrics.set(task.id, { bytes, readBytes, writeBytes, sampledAt: progressSampledAt, readSpeed, writeSpeed });
 }
 
 function taskCategory(task) {
-  if (task.status === "completed") return "success";
+  if (task.status === "completed" || task.status === "skipped") return "success";
   if (task.status === "failed") return "failed";
   return "queue";
 }
@@ -1832,12 +2121,23 @@ function renderTaskList() {
     const verifiedPercent = task.size ? Math.min(100, task.bytes_verified / task.size * 100) : 100;
     const row = document.createElement("div");
     row.className = "task";
-    const metric = state.transferMetrics.get(task.id) || { speed: 0 };
-    const terminalTime = ["completed", "failed"].includes(task.status) ? new Date(task.updated_at).getTime() : Date.now();
+    const metric = state.transferMetrics.get(task.id) || { speed: 0, readSpeed: 0, writeSpeed: 0 };
+    const terminalTime = ["completed", "skipped", "failed"].includes(task.status) ? new Date(task.updated_at).getTime() : Date.now();
     const elapsedSeconds = Math.max(0, (terminalTime - new Date(task.created_at).getTime()) / 1000);
-    const remainingSeconds = metric.speed > 0 && ["running", "verifying"].includes(task.status) ? Math.max(0, (task.size - transferred) / metric.speed) : NaN;
+    const progressSpeed = metric.writeSpeed > 0 ? metric.writeSpeed : metric.readSpeed;
+    const remainingSeconds = progressSpeed > 0 && ["running", "verifying"].includes(task.status) ? Math.max(0, (task.size - transferred) / progressSpeed) : NaN;
     const direction = task.source_provider === currentProvider("left") && task.target_provider === currentProvider("right") ? "上传" : task.source_provider === currentProvider("right") && task.target_provider === currentProvider("left") ? "下载" : "传输";
-    row.innerHTML = `<span class="task-route" title="${escapeHTML(task.source_path)} → ${escapeHTML(task.target_path)}">${direction}　${escapeHTML(task.source_path)} → ${escapeHTML(task.target_path)}</span><span class="progress-track" title="${statusLabel(task.status)} · 已传输 ${transferPercent.toFixed(1)}% · 已校验 ${verifiedPercent.toFixed(1)}%"><i class="progress-transferred" style="width:${transferPercent.toFixed(2)}%"></i><i class="progress-verified" style="width:${verifiedPercent.toFixed(2)}%"></i></span><span class="task-status">${formatBytes(transferred)} / ${formatBytes(task.size)}</span><span class="task-status" title="${statusLabel(task.status)} · 平均速度">${statusLabel(task.status)} ${metric.speed > 0 ? `${formatBytes(metric.speed)}/s` : "--"}</span><span class="task-status" title="预计剩余时间">剩余 ${formatDuration(remainingSeconds)}</span><span class="task-status" title="已经过时间">已用 ${formatDuration(elapsedSeconds)}</span>`;
+    const selectable = taskCategory(task) === "success";
+    const checkbox = selectable ? `<input class="task-select" type="checkbox" aria-label="选择任务" ${state.taskSelection.has(task.id) ? "checked" : ""}>` : "";
+    row.innerHTML = `<span class="task-route" title="${escapeHTML(task.source_path)} → ${escapeHTML(task.target_path)}">${checkbox}${direction}　${escapeHTML(task.source_path)} → ${escapeHTML(task.target_path)}</span><span class="progress-track" title="${statusLabel(task.status)} · 已传输 ${transferPercent.toFixed(1)}% · 已校验 ${verifiedPercent.toFixed(1)}%"><i class="progress-transferred" style="width:${transferPercent.toFixed(2)}%"></i><i class="progress-verified" style="width:${verifiedPercent.toFixed(2)}%"></i></span><span class="task-status">${formatBytes(transferred)} / ${formatBytes(task.size)}</span><span class="task-status task-throughput" title="读取和写入平均速度">读 ${metric.readSpeed > 0 ? `${formatBytes(metric.readSpeed)}/s` : "--"}　写 ${metric.writeSpeed > 0 ? `${formatBytes(metric.writeSpeed)}/s` : "--"}</span><span class="task-status" title="预计剩余时间">剩余 ${formatDuration(remainingSeconds)}</span><span class="task-status" title="已经过时间">已用 ${formatDuration(elapsedSeconds)}</span>`;
+    if (selectable) {
+      $(".task-select", row).addEventListener("click", (event) => event.stopPropagation());
+      $(".task-select", row).addEventListener("change", (event) => {
+        if (event.target.checked) state.taskSelection.add(task.id);
+        else state.taskSelection.delete(task.id);
+        renderTaskList();
+      });
+    }
     row.addEventListener("contextmenu", (event) => { event.preventDefault(); showTaskMenu(event, task); });
     return row;
   }));
@@ -1878,8 +2178,128 @@ function showTaskMenu(event, task) {
   const items = [];
   if (["running", "verifying"].includes(task.status)) items.push({ label: "暂停任务", action: () => taskAction(task.id, "pause") });
   else if (["paused", "failed"].includes(task.status)) items.push({ label: "继续任务", action: () => taskAction(task.id, "resume") });
+  if (["completed", "skipped"].includes(task.status)) {
+    const selected = state.tasks.filter((item) => state.taskSelection.has(item.id) && ["completed", "skipped"].includes(item.status));
+    const tasks = selected.length > 1 ? selected : [task];
+    items.push(
+      { label: tasks.length > 1 ? "保存选中的 " + tasks.length + " 个任务为模板…" : "保存为模板…", action: () => saveTasksAsTemplate(tasks) },
+      { label: "添加到模板", action: () => appendTasksToTemplate(tasks.map(templateTaskFromTransfer)) },
+    );
+  }
   items.push({ separator: true }, { label: "删除任务", danger: true, action: () => deleteTask(task.id) });
   showContextMenu(event.clientX, event.clientY, items);
+}
+
+async function runTransferTemplate(id) {
+  if (!id) return;
+  const template = state.transferTemplates.find((item) => item.id === id);
+  if (!template) return;
+  const providerIDs = new Set((template.tasks || []).flatMap((item) => [item.source_provider, item.target_provider]).filter(Boolean));
+  for (const providerID of providerIDs) {
+    const provider = providerByID(providerID);
+    if (provider?.kind !== "local" && !provider?.connected) {
+      if (!await connectSavedSession(providerID)) return;
+    }
+  }
+  try {
+    const result = await api(`/api/v1/transfer-templates/${encodeURIComponent(id)}/run`, { method: "POST", body: "{}" });
+    state.taskFilter = "queue";
+    $("#transferQueue").classList.remove("collapsed");
+    renderTaskList();
+    const detail = result.failed?.length ? `，${result.failed.length} 项失败` : "";
+    toast(`模板“${template.name}”已执行 ${result.started || 0} 项${detail}`, result.failed?.length ? "error" : "info");
+  } catch (error) {
+    toast(`${error.message}${error.payload?.detail ? `：${error.payload.detail}` : ""}`, "error");
+  }
+}
+
+function templateTaskFromTransfer(task) {
+  return {
+    source_provider: task.source_provider, source_path: task.source_path,
+    target_provider: task.target_provider, target_path: task.target_path,
+    conflict_policy: task.conflict_policy === "ask" ? "overwrite" : (task.conflict_policy || "overwrite"),
+    concurrency: task.concurrency || 4, verify: task.verify !== false,
+    preserve_structure: task.preserve_structure !== false, filter: task.filter || "",
+  };
+}
+
+function chooseTransferTemplate() {
+  if (!state.transferTemplates.length) {
+    toast("还没有发布模板，请先保存一个模板", "error");
+    return Promise.resolve(null);
+  }
+  const dialog = $("#templateChooseDialog");
+  const select = $("#templateChooseForm").elements.template;
+  select.replaceChildren(...state.transferTemplates.map((template) => new Option(template.name, template.id)));
+  dialog.showModal();
+  return new Promise((resolve) => { state.templateChooseResolve = resolve; });
+}
+
+function closeTemplateChooser(result) {
+  const dialog = $("#templateChooseDialog");
+  if (dialog.open) dialog.close();
+  const resolve = state.templateChooseResolve;
+  state.templateChooseResolve = null;
+  resolve?.(result || null);
+}
+
+async function appendTasksToTemplate(tasks) {
+  if (!tasks.length) return;
+  const templateID = await chooseTransferTemplate();
+  const template = state.transferTemplates.find((item) => item.id === templateID);
+  if (!template) return;
+  const existing = (template.tasks?.length ? template.tasks : [template]).map(templateTaskFromTransfer);
+  const keys = new Set(existing.map((item) => item.source_provider + "\u0000" + item.source_path + "\u0000" + item.target_provider + "\u0000" + item.target_path));
+  const additions = tasks.filter((item) => {
+    const normalized = templateTaskFromTransfer(item);
+    const key = normalized.source_provider + "\u0000" + normalized.source_path + "\u0000" + normalized.target_provider + "\u0000" + normalized.target_path;
+    if (keys.has(key)) return false;
+    keys.add(key);
+    return true;
+  }).map(templateTaskFromTransfer);
+  if (!additions.length) {
+    toast("所选发布项已经在模板中");
+    return;
+  }
+  try {
+    const saved = await api("/api/v1/transfer-templates", {
+      method: "POST",
+      body: JSON.stringify({ ...template, tasks: existing.concat(additions) }),
+    });
+    await loadTransferTemplates();
+    toast("已添加 " + additions.length + " 个发布项到模板“" + saved.name + "”");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function saveTemplateTaskSet(tasks) {
+  if (!tasks.length) return;
+  const defaultName = tasks.length === 1 ? `${tasks[0].source_provider} → ${tasks[0].target_provider}` : `发布任务（${tasks.length}项）`;
+  const name = prompt("模板名称", defaultName);
+  if (!name?.trim()) return;
+  try {
+    const templateTasks = tasks.map(templateTaskFromTransfer);
+    const first = templateTasks[0];
+    const saved = await api("/api/v1/transfer-templates", {
+      method: "POST",
+      body: JSON.stringify({
+        name: name.trim(), source_provider: first.source_provider, target_provider: first.target_provider,
+        source_path: parentPath(first.source_path), target_path: parentPath(first.target_path),
+        conflict_policy: first.conflict_policy, concurrency: first.concurrency,
+        verify: first.verify, preserve_structure: first.preserve_structure, filter: first.filter,
+        tasks: templateTasks,
+      }),
+    });
+    await loadTransferTemplates();
+    toast(`模板“${saved.name}”已保存`);
+  } catch (error) {
+    toast(`${error.message}${error.payload?.detail ? `：${error.payload.detail}` : ""}`, "error");
+  }
+}
+
+function saveTasksAsTemplate(tasks) {
+  return saveTemplateTaskSet(tasks);
 }
 
 async function taskAction(id, action) {
@@ -1908,7 +2328,7 @@ async function clearTaskHistory() {
   } catch (error) { toast(error.message, "error"); }
 }
 
-function statusLabel(status) { return ({ running: "传输", verifying: "校验", paused: "暂停", failed: "失败", completed: "完成" })[status] || status; }
+function statusLabel(status) { return ({ running: "传输", verifying: "校验", paused: "暂停", failed: "失败", completed: "完成", skipped: "已跳过" })[status] || status; }
 
 async function saveConnection(form, connectAfterSave) {
   const data = Object.fromEntries(new FormData(form));
@@ -2478,7 +2898,7 @@ function initializeQueueResize() {
 
 async function main() {
   try {
-    await loadProviders(false); await loadBookmarks(); initializeWorkspace(); renderSessionTree();
+    await loadProviders(false); await loadBookmarks(); await loadTransferTemplates(); initializeWorkspace(); renderSessionTree();
 	    bindPanel("left"); bindPanel("right"); renderTabs("left"); renderTabs("right");
 	    initializeQueueResize();
 	    initializeHTMLViewportResize();
@@ -2495,6 +2915,55 @@ $("#sidebarAdd").addEventListener("click", () => prepareNewSession());
 $("#sessionGroupControl > button").addEventListener("click", toggleSessionGroupMenu);
 $("#sessionGroupControl input[name=group]").addEventListener("keydown", handleSessionGroupKey);
 $("#connectionForm").addEventListener("submit", (event) => { event.preventDefault(); saveConnection(event.currentTarget, event.submitter?.value === "connect"); });
+$("#transferOptionsForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  closeTransferOptions({
+    conflict_policy: state.transferConflictPolicy,
+    always: form.elements.always.checked,
+  });
+});
+function skipTransferConflict() {
+  closeTransferOptions({ conflict_policy: "skip", cancelled: true });
+}
+$("#transferOptionsCancel").addEventListener("click", skipTransferConflict);
+$("#transferOptionsClose").addEventListener("click", skipTransferConflict);
+$("#transferOptionsDialog").addEventListener("cancel", (event) => { event.preventDefault(); skipTransferConflict(); });
+$$('#conflictActionList button').forEach((button) => button.addEventListener("click", () => {
+  state.transferConflictPolicy = button.dataset.conflictPolicy;
+  $$("#conflictActionList button").forEach((item) => {
+    const selected = item === button;
+    item.classList.toggle("selected", selected);
+    item.setAttribute("aria-selected", String(selected));
+  });
+}));
+$("#publishTemplateForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const template = state.editingPublishTemplate;
+  const name = event.currentTarget.elements.name.value.trim();
+  if (!template || !name) return;
+  if (!template.tasks?.length) { toast("发布任务至少需要一个发布项", "error"); return; }
+  template.name = name;
+  try {
+    const saved = await api("/api/v1/transfer-templates", { method: "POST", body: JSON.stringify(template) });
+    $("#publishTemplateDialog").close();
+    state.editingPublishTemplate = null;
+    await loadTransferTemplates();
+    toast("发布任务“" + saved.name + "”已保存");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+});
+$("#publishTemplateCancel").addEventListener("click", () => $("#publishTemplateDialog").close());
+$("#publishTemplateClose").addEventListener("click", () => $("#publishTemplateDialog").close());
+$("#templateChooseForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  closeTemplateChooser(event.currentTarget.elements.template.value);
+});
+$("#templateChooseCancel").addEventListener("click", () => closeTemplateChooser(null));
+$("#templateChooseClose").addEventListener("click", () => closeTemplateChooser(null));
+$("#templateChooseDialog").addEventListener("cancel", (event) => { event.preventDefault(); closeTemplateChooser(null); });
+$$(".sidebar-tab").forEach((button) => button.addEventListener("click", () => setSidebarTab(button.dataset.sidebarTab)));
 $("#connectionProtocol").addEventListener("change", (event) => setConnectionProtocol(event.target.value));
 $("#connectionAuthMethod").addEventListener("change", updateConnectionAuthFields);
 $("#choosePrivateKey").addEventListener("click", () => $("#privateKeyUpload").click());
