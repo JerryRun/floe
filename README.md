@@ -27,6 +27,22 @@ Floe 是一个由本地 Go Core 驱动的浏览器文件工作台。当前体验
 - 原生 Windows 托盘菜单和单实例保护，Windows 版不显示 CMD 窗口。
 - 托盘可配置启动时是否自动打开浏览器，设置保存在 `settings.json`。
 
+## 界面预览
+
+### 双面板与传输队列
+
+![Floe 双面板与传输队列](docs/screenshots/floe-main.png)
+
+### 发布任务模板
+
+![Floe 发布任务模板](docs/screenshots/floe-publish.png)
+
+### 文件冲突处理
+
+![Floe 文件冲突处理](docs/screenshots/floe-conflict.png)
+
+截图使用匿名演示数据，不包含真实服务器、账号或用户文件。
+
 ## 从源码运行
 
 ```bash
