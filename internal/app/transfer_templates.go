@@ -32,15 +32,21 @@ type TransferTemplate struct {
 }
 
 type TransferTemplateTask struct {
-	SourceProvider    string `json:"source_provider"`
-	SourcePath        string `json:"source_path"`
-	TargetProvider    string `json:"target_provider"`
-	TargetPath        string `json:"target_path"`
-	ConflictPolicy    string `json:"conflict_policy"`
-	Concurrency       int    `json:"concurrency"`
-	Verify            bool   `json:"verify"`
-	PreserveStructure bool   `json:"preserve_structure"`
-	Filter            string `json:"filter,omitempty"`
+	SourceProvider         string `json:"source_provider"`
+	SourcePath             string `json:"source_path"`
+	SourceProviderName     string `json:"source_provider_name,omitempty"`
+	SourceProviderKind     string `json:"source_provider_kind,omitempty"`
+	SourceProviderLocation string `json:"source_provider_location,omitempty"`
+	TargetProvider         string `json:"target_provider"`
+	TargetPath             string `json:"target_path"`
+	TargetProviderName     string `json:"target_provider_name,omitempty"`
+	TargetProviderKind     string `json:"target_provider_kind,omitempty"`
+	TargetProviderLocation string `json:"target_provider_location,omitempty"`
+	ConflictPolicy         string `json:"conflict_policy"`
+	Concurrency            int    `json:"concurrency"`
+	Verify                 bool   `json:"verify"`
+	PreserveStructure      bool   `json:"preserve_structure"`
+	Filter                 string `json:"filter,omitempty"`
 }
 
 type transferTemplateStore struct {
@@ -85,6 +91,9 @@ func normalizeTransferTemplate(item TransferTemplate) TransferTemplate {
 		item.Tasks = []TransferTemplateTask{{SourceProvider: item.SourceProvider, SourcePath: item.SourcePath, TargetProvider: item.TargetProvider, TargetPath: item.TargetPath, ConflictPolicy: item.ConflictPolicy, Concurrency: item.Concurrency, Verify: item.Verify, PreserveStructure: item.PreserveStructure, Filter: item.Filter}}
 	}
 	if len(item.Tasks) > 0 {
+		for i := range item.Tasks {
+			item.Tasks[i] = normalizeTransferTemplateTask(item.Tasks[i])
+		}
 		first := item.Tasks[0]
 		item.SourceProvider, item.SourcePath = first.SourceProvider, first.SourcePath
 		item.TargetProvider, item.TargetPath = first.TargetProvider, first.TargetPath
@@ -92,6 +101,30 @@ func normalizeTransferTemplate(item TransferTemplate) TransferTemplate {
 		item.Verify, item.PreserveStructure, item.Filter = first.Verify, first.PreserveStructure, first.Filter
 	}
 	return item
+}
+
+func normalizeTransferTemplateTask(task TransferTemplateTask) TransferTemplateTask {
+	task.SourceProvider = strings.TrimSpace(task.SourceProvider)
+	task.SourceProviderName = strings.TrimSpace(task.SourceProviderName)
+	task.SourceProviderKind = strings.TrimSpace(task.SourceProviderKind)
+	task.SourceProviderLocation = strings.TrimSpace(task.SourceProviderLocation)
+	task.SourcePath = strings.TrimSpace(task.SourcePath)
+	task.TargetProvider = strings.TrimSpace(task.TargetProvider)
+	task.TargetProviderName = strings.TrimSpace(task.TargetProviderName)
+	task.TargetProviderKind = strings.TrimSpace(task.TargetProviderKind)
+	task.TargetProviderLocation = strings.TrimSpace(task.TargetProviderLocation)
+	task.TargetPath = strings.TrimSpace(task.TargetPath)
+	task.ConflictPolicy = strings.TrimSpace(task.ConflictPolicy)
+	if task.ConflictPolicy == "" {
+		task.ConflictPolicy = "overwrite"
+	}
+	if task.Concurrency < 1 {
+		task.Concurrency = 4
+	}
+	if task.Concurrency > 8 {
+		task.Concurrency = 8
+	}
+	return task
 }
 
 func (s *transferTemplateStore) Get(id string) (TransferTemplate, bool) {

@@ -122,6 +122,7 @@ func (s *Server) Start(address string) (string, <-chan error, error) {
 	s.origin = origin
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /askpass/{token}", s.askPass)
+	mux.HandleFunc("POST /askpass/{token}/revoke", s.revokeAskPassHTTP)
 	mux.HandleFunc("/api/", s.api)
 	mux.HandleFunc("/", s.static)
 	s.httpServer = &http.Server{
@@ -960,18 +961,56 @@ func (s *Server) saveTransferTemplate(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &item) {
 		return
 	}
+	item = normalizeTransferTemplate(item)
 	policy, err := core.NormalizeConflictPolicy(item.ConflictPolicy)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "TEMPLATE_INVALID", "冲突策略无效", err.Error())
 		return
 	}
 	item.ConflictPolicy = policy
+	for i := range item.Tasks {
+		policy, err := core.NormalizeConflictPolicy(item.Tasks[i].ConflictPolicy)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "TEMPLATE_INVALID", "冲突策略无效", err.Error())
+			return
+		}
+		item.Tasks[i].ConflictPolicy = policy
+		s.enrichTransferTemplateTaskProviders(&item.Tasks[i])
+	}
 	saved, err := s.templates.Save(item)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "TEMPLATE_SAVE_FAILED", "保存传输模板失败", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, saved)
+}
+
+func (s *Server) enrichTransferTemplateTaskProviders(task *TransferTemplateTask) {
+	enrich := func(id, path string, name, kind, location *string) {
+		if provider, ok := s.manager.Get(id); ok {
+			if *name == "" {
+				*name = provider.Name()
+			}
+			if *kind == "" {
+				*kind = provider.Kind()
+			}
+			if *location == "" {
+				*location = provider.Location()
+			}
+			return
+		}
+		if *kind == "" && strings.HasPrefix(id, "local-") {
+			*kind = "local"
+		}
+		if *kind == "local" && *location == "" && filepath.IsAbs(path) {
+			*location = string(filepath.Separator)
+		}
+		if *kind == "local" && *name == "" {
+			*name = localProviderName(*location)
+		}
+	}
+	enrich(task.SourceProvider, task.SourcePath, &task.SourceProviderName, &task.SourceProviderKind, &task.SourceProviderLocation)
+	enrich(task.TargetProvider, task.TargetPath, &task.TargetProviderName, &task.TargetProviderKind, &task.TargetProviderLocation)
 }
 
 func (s *Server) deleteTransferTemplate(w http.ResponseWriter, r *http.Request) {
@@ -997,6 +1036,22 @@ func (s *Server) runTransferTemplate(w http.ResponseWriter, r *http.Request) {
 	tasks := make([]core.TransferTask, 0, len(template.Tasks))
 	failures := make([]string, 0)
 	for _, item := range template.Tasks {
+		source := templateProviderReference{
+			ID: item.SourceProvider, Name: item.SourceProviderName,
+			Kind: item.SourceProviderKind, Location: item.SourceProviderLocation, Path: item.SourcePath,
+		}
+		target := templateProviderReference{
+			ID: item.TargetProvider, Name: item.TargetProviderName,
+			Kind: item.TargetProviderKind, Location: item.TargetProviderLocation, Path: item.TargetPath,
+		}
+		if err := s.ensureTemplateProvider(source, "源"); err != nil {
+			failures = append(failures, fmt.Sprintf("%s → %s: %v", item.SourcePath, item.TargetPath, err))
+			continue
+		}
+		if err := s.ensureTemplateProvider(target, "目标"); err != nil {
+			failures = append(failures, fmt.Sprintf("%s → %s: %v", item.SourcePath, item.TargetPath, err))
+			continue
+		}
 		verify := item.Verify
 		request := core.TransferRequest{
 			SourceProvider: item.SourceProvider, SourcePath: item.SourcePath,
@@ -1019,6 +1074,78 @@ func (s *Server) runTransferTemplate(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusBadRequest
 	}
 	writeJSON(w, status, map[string]any{"tasks": tasks, "started": len(tasks), "failed": failures})
+}
+
+type templateProviderReference struct {
+	ID       string
+	Name     string
+	Kind     string
+	Location string
+	Path     string
+}
+
+func (s *Server) ensureTemplateProvider(ref templateProviderReference, role string) error {
+	if _, ok := s.manager.Get(ref.ID); ok {
+		return nil
+	}
+	if ref.Kind == "" && strings.HasPrefix(ref.ID, "local-") {
+		ref.Kind = "local"
+	}
+	if ref.Kind == "local" && ref.Location == "" && filepath.IsAbs(ref.Path) {
+		ref.Location = string(filepath.Separator)
+	}
+	if ref.Kind == "local" || ref.Location != "" && strings.HasPrefix(ref.ID, "local-") {
+		return s.ensureLocalTemplateProvider(ref, role)
+	}
+	return s.ensureTransferProvider(ref.ID, role)
+}
+
+func (s *Server) ensureLocalTemplateProvider(ref templateProviderReference, role string) error {
+	if ref.ID == "" {
+		return fmt.Errorf("%s本地标签无效", role)
+	}
+	root := strings.TrimSpace(ref.Location)
+	if root == "" {
+		return fmt.Errorf("%s本地标签已失效，请重新创建本地标签后新建任务", role)
+	}
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("%s本地路径无效: %w", role, err)
+	}
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() {
+		if err != nil {
+			return fmt.Errorf("%s本地目录不存在: %w", role, err)
+		}
+		return fmt.Errorf("%s本地路径不是目录: %s", role, root)
+	}
+	provider, err := core.NewLocalFSWithKind(ref.ID, localProviderNameOr(ref.Name, root), root, "local", "本地")
+	if err != nil {
+		return fmt.Errorf("%s本地标签恢复失败: %w", role, err)
+	}
+	s.manager.Add(provider)
+	s.activity.Add("info", "local", "发布任务已恢复本地标签 "+provider.Name(), fmt.Sprintf("%s端 · %s", role, root))
+	return nil
+}
+
+func localProviderNameOr(name, root string) string {
+	name = strings.TrimSpace(name)
+	if name != "" {
+		return name
+	}
+	return localProviderName(root)
+}
+
+func localProviderName(root string) string {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return "本地"
+	}
+	name := filepath.Base(filepath.Clean(root))
+	if name == "." || name == string(filepath.Separator) || name == "" {
+		return root
+	}
+	return name
 }
 
 func (s *Server) enqueueDirectory(source, target core.FileSystem, req core.TransferRequest, tasks *[]core.TransferTask, limit int) error {

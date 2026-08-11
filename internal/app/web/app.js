@@ -264,8 +264,9 @@ function templateTasks(template) {
   return template?.tasks?.length ? template.tasks : (template ? [template] : []);
 }
 
-function templateProviderName(id) {
-  return providerByID(id)?.name || id || "未指定";
+function templateTaskProviderName(item, role) {
+  const id = item?.[`${role}_provider`];
+  return providerByID(id)?.name || item?.[`${role}_provider_name`] || id || "未指定";
 }
 
 function latestPublishTask(item) {
@@ -324,7 +325,7 @@ function publishTaskGroups(template) {
   const groups = new Map();
   for (const item of templateTasks(template)) {
     const key = `${item.source_provider}\u0000${item.target_provider}`;
-    if (!groups.has(key)) groups.set(key, { source: item.source_provider, target: item.target_provider, items: [] });
+    if (!groups.has(key)) groups.set(key, { sourceName: templateTaskProviderName(item, "source"), targetName: templateTaskProviderName(item, "target"), items: [] });
     groups.get(key).items.push(item);
   }
   return [...groups.values()];
@@ -333,7 +334,7 @@ function publishTaskGroups(template) {
 function publishTaskDetailsHTML(template, editable = false) {
   const groups = publishTaskGroups(template);
   const groupsHTML = groups.map((group) => {
-    const heading = `${templateProviderName(group.source)} -> ${templateProviderName(group.target)}:`;
+    const heading = `${group.sourceName} -> ${group.targetName}:`;
     const items = group.items.map((item) => `<div class="publish-detail-item"><span>- ${escapeHTML(item.source_path || "/")} -> ${escapeHTML(item.target_path || "/")}</span></div>`).join("");
     return `<section class="publish-detail-group"><strong>${escapeHTML(heading)}</strong>${items}</section>`;
   }).join("");
@@ -366,7 +367,7 @@ function renderPublishTemplateEditor() {
   list.replaceChildren(...groups.flatMap((group) => {
     const heading = document.createElement("div");
     heading.className = "publish-editor-group";
-    heading.textContent = templateProviderName(group.source) + " -> " + templateProviderName(group.target) + ":";
+    heading.textContent = group.sourceName + " -> " + group.targetName + ":";
     return [heading, ...group.items.map((item) => {
       const index = tasks.indexOf(item);
       const row = document.createElement("div");
@@ -2214,9 +2215,17 @@ async function runTransferTemplate(id) {
 }
 
 function templateTaskFromTransfer(task) {
+  const sourceProvider = providerByID(task.source_provider);
+  const targetProvider = providerByID(task.target_provider);
   return {
     source_provider: task.source_provider, source_path: task.source_path,
+    source_provider_name: task.source_provider_name || sourceProvider?.name || "",
+    source_provider_kind: task.source_provider_kind || sourceProvider?.kind || "",
+    source_provider_location: task.source_provider_location || sourceProvider?.location || "",
     target_provider: task.target_provider, target_path: task.target_path,
+    target_provider_name: task.target_provider_name || targetProvider?.name || "",
+    target_provider_kind: task.target_provider_kind || targetProvider?.kind || "",
+    target_provider_location: task.target_provider_location || targetProvider?.location || "",
     conflict_policy: task.conflict_policy === "ask" ? "overwrite" : (task.conflict_policy || "overwrite"),
     concurrency: task.concurrency || 4, verify: task.verify !== false,
     preserve_structure: task.preserve_structure !== false, filter: task.filter || "",

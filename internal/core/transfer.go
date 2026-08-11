@@ -33,20 +33,26 @@ type BlockState struct {
 }
 
 type TransferTask struct {
-	ID               string    `json:"id"`
-	SourceProvider   string    `json:"source_provider"`
-	SourcePath       string    `json:"source_path"`
-	TargetProvider   string    `json:"target_provider"`
-	TargetPath       string    `json:"target_path"`
-	PartPath         string    `json:"part_path"`
-	Size             int64     `json:"size"`
-	SourceModified   time.Time `json:"source_modified"`
-	BlockSize        int64     `json:"block_size"`
-	Concurrency      int       `json:"concurrency"`
-	ConflictPolicy   string    `json:"conflict_policy"`
-	Verify           bool      `json:"verify"`
-	BytesVerified    int64     `json:"bytes_verified"`
-	BytesTransferred int64     `json:"bytes_transferred"`
+	ID                     string    `json:"id"`
+	SourceProvider         string    `json:"source_provider"`
+	SourcePath             string    `json:"source_path"`
+	SourceProviderName     string    `json:"source_provider_name,omitempty"`
+	SourceProviderKind     string    `json:"source_provider_kind,omitempty"`
+	SourceProviderLocation string    `json:"source_provider_location,omitempty"`
+	TargetProvider         string    `json:"target_provider"`
+	TargetPath             string    `json:"target_path"`
+	TargetProviderName     string    `json:"target_provider_name,omitempty"`
+	TargetProviderKind     string    `json:"target_provider_kind,omitempty"`
+	TargetProviderLocation string    `json:"target_provider_location,omitempty"`
+	PartPath               string    `json:"part_path"`
+	Size                   int64     `json:"size"`
+	SourceModified         time.Time `json:"source_modified"`
+	BlockSize              int64     `json:"block_size"`
+	Concurrency            int       `json:"concurrency"`
+	ConflictPolicy         string    `json:"conflict_policy"`
+	Verify                 bool      `json:"verify"`
+	BytesVerified          int64     `json:"bytes_verified"`
+	BytesTransferred       int64     `json:"bytes_transferred"`
 	// Cumulative physical I/O counters used for queue read/write throughput.
 	// They intentionally include bytes read or written again during retries.
 	BytesRead    int64        `json:"bytes_read"`
@@ -378,7 +384,9 @@ func (e *TransferEngine) Create(req TransferRequest) (TransferTask, error) {
 	}
 	task := &TransferTask{
 		ID: taskID, SourceProvider: req.SourceProvider,
+		SourceProviderName: source.Name(), SourceProviderKind: source.Kind(), SourceProviderLocation: source.Location(),
 		SourcePath: req.SourcePath, TargetProvider: req.TargetProvider, TargetPath: actualTargetPath,
+		TargetProviderName: target.Name(), TargetProviderKind: target.Kind(), TargetProviderLocation: target.Location(),
 		PartPath: partPath, Size: info.Size, SourceModified: info.Modified, BlockSize: blockSize,
 		Concurrency: req.Concurrency, ConflictPolicy: policy, Verify: req.Verify == nil || *req.Verify,
 		Status: "running", CreatedAt: now, UpdatedAt: now, Blocks: blocks,

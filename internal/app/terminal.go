@@ -19,11 +19,15 @@ import (
 	"floe/internal/core"
 )
 
-const askPassLifetime = 90 * time.Second
+const (
+	askPassLifetime         = 90 * time.Second
+	terminalAskPassLifetime = 12 * time.Hour
+)
 
 type askPassSecret struct {
-	Password  string
-	ExpiresAt time.Time
+	Password     string
+	ExpiresAt    time.Time
+	ConsumeOnUse bool
 }
 
 type terminalRequest struct {
@@ -35,6 +39,14 @@ type terminalRequest struct {
 }
 
 func (s *Server) issueAskPass(password string) (string, string) {
+	return s.issueAskPassToken(password, askPassLifetime, true)
+}
+
+func (s *Server) issueTerminalAskPass(password string) (string, string) {
+	return s.issueAskPassToken(password, terminalAskPassLifetime, false)
+}
+
+func (s *Server) issueAskPassToken(password string, lifetime time.Duration, consumeOnUse bool) (string, string) {
 	now := time.Now()
 	token := randomToken(32)
 	s.askPassMu.Lock()
@@ -43,7 +55,7 @@ func (s *Server) issueAskPass(password string) (string, string) {
 			delete(s.askPassTokens, key)
 		}
 	}
-	s.askPassTokens[token] = askPassSecret{Password: password, ExpiresAt: now.Add(askPassLifetime)}
+	s.askPassTokens[token] = askPassSecret{Password: password, ExpiresAt: now.Add(lifetime), ConsumeOnUse: consumeOnUse}
 	s.askPassMu.Unlock()
 	return token, s.origin + "/askpass/" + token
 }
@@ -58,9 +70,12 @@ func (s *Server) consumeAskPass(token string) (string, bool) {
 	s.askPassMu.Lock()
 	defer s.askPassMu.Unlock()
 	secret, ok := s.askPassTokens[token]
-	delete(s.askPassTokens, token)
 	if !ok || !secret.ExpiresAt.After(time.Now()) {
+		delete(s.askPassTokens, token)
 		return "", false
+	}
+	if secret.ConsumeOnUse {
+		delete(s.askPassTokens, token)
 	}
 	return secret.Password, true
 }
@@ -80,6 +95,16 @@ func (s *Server) askPass(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	_, _ = io.WriteString(w, password)
+}
+
+func (s *Server) revokeAskPassHTTP(w http.ResponseWriter, r *http.Request) {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
+		http.Error(w, "loopback access required", http.StatusForbidden)
+		return
+	}
+	s.revokeAskPass(r.PathValue("token"))
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // RunAskPass serves the short-lived SSH_ASKPASS child-process mode. It must be
@@ -162,9 +187,10 @@ func (s *Server) openTerminal(w http.ResponseWriter, r *http.Request) {
 
 	var token, endpoint string
 	if boolValue(saved.TerminalAutoPassword, true) && saved.Password != "" {
-		token, endpoint = s.issueAskPass(saved.Password)
+		token, endpoint = s.issueTerminalAskPass(saved.Password)
 	}
-	scriptPath, err := s.writeSSHScript(endpoint, sshArgs)
+	title := terminalTitle(saved, target)
+	scriptPath, err := s.writeSSHScript(title, endpoint, sshArgs)
 	if err != nil {
 		if token != "" {
 			s.revokeAskPass(token)
@@ -172,7 +198,7 @@ func (s *Server) openTerminal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "TERMINAL_SCRIPT_FAILED", "无法准备 SSH 启动脚本", err.Error())
 		return
 	}
-	args, err := buildTerminalArgs(req, target.User+"@"+target.Host, scriptPath, preferredPowerShell())
+	args, err := buildTerminalArgs(req, title, scriptPath, preferredPowerShell())
 	if err != nil {
 		_ = os.Remove(scriptPath)
 		if token != "" {
@@ -192,6 +218,13 @@ func (s *Server) openTerminal(w http.ResponseWriter, r *http.Request) {
 	}
 	s.activity.Add("info", "terminal", "已打开 SSH 终端", target.User+"@"+target.Host)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "askpass": token != ""})
+}
+
+func terminalTitle(saved core.ConnectRequest, target core.ConnectionTarget) string {
+	if name := strings.TrimSpace(saved.Name); name != "" {
+		return name
+	}
+	return target.User + "@" + target.Host
 }
 
 func buildSSHArgs(saved core.ConnectRequest, target core.ConnectionTarget) []string {
@@ -247,7 +280,7 @@ func buildTerminalArgs(req terminalRequest, title, scriptPath, shellPath string)
 	return args, nil
 }
 
-func (s *Server) writeSSHScript(askPassURL string, sshArgs []string) (string, error) {
+func (s *Server) writeSSHScript(title, askPassURL string, sshArgs []string) (string, error) {
 	directory := filepath.Join(s.dataDir, "terminal")
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return "", err
@@ -275,11 +308,19 @@ func (s *Server) writeSSHScript(askPassURL string, sshArgs []string) (string, er
 	}
 	var script strings.Builder
 	script.WriteString("$ErrorActionPreference = 'Stop'\r\n")
+	if title != "" {
+		script.WriteString("$Host.UI.RawUI.WindowTitle = '")
+		script.WriteString(powerShellSingleQuoted(title))
+		script.WriteString("'\r\n")
+	}
+	script.WriteString("$revokeAskPassURL = ''\r\n")
 	if askPassURL != "" {
 		script.WriteString("$env:SSH_ASKPASS = '")
-		script.WriteString(strings.ReplaceAll(executable, "'", "''"))
+		script.WriteString(powerShellSingleQuoted(executable))
 		script.WriteString("'\r\n$env:SSH_ASKPASS_REQUIRE = 'force'\r\n$env:DISPLAY = 'floe'\r\n$env:FLOE_ASKPASS_URL = '")
-		script.WriteString(strings.ReplaceAll(askPassURL, "'", "''"))
+		script.WriteString(powerShellSingleQuoted(askPassURL))
+		script.WriteString("'\r\n$revokeAskPassURL = '")
+		script.WriteString(powerShellSingleQuoted(askPassURL + "/revoke"))
 		script.WriteString("'\r\n")
 	}
 	script.WriteString("$sshArgs = @(")
@@ -288,10 +329,29 @@ func (s *Server) writeSSHScript(askPassURL string, sshArgs []string) (string, er
 			script.WriteString(", ")
 		}
 		script.WriteString("'")
-		script.WriteString(strings.ReplaceAll(arg, "'", "''"))
+		script.WriteString(powerShellSingleQuoted(arg))
 		script.WriteString("'")
 	}
-	script.WriteString(")\r\ntry { & ssh.exe @sshArgs } finally { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue }\r\n")
+	script.WriteString(")\r\n")
+	script.WriteString("try {\r\n")
+	script.WriteString("  while ($true) {\r\n")
+	script.WriteString("    & ssh.exe @sshArgs\r\n")
+	script.WriteString("    $exitCode = $LASTEXITCODE\r\n")
+	script.WriteString("    Write-Host ''\r\n")
+	script.WriteString("    if ($exitCode -eq 0) { Write-Host 'SSH 会话已结束。' } else { Write-Host \"SSH 连接已断开或退出，退出码 $exitCode。\" }\r\n")
+	script.WriteString("    Write-Host '按 R 立即重连；按 Enter、Esc 或其他键结束。' -NoNewline\r\n")
+	script.WriteString("    $key = [Console]::ReadKey($true)\r\n")
+	script.WriteString("    Write-Host ''\r\n")
+	script.WriteString("    if ($key.Key -ne [ConsoleKey]::R) { break }\r\n")
+	script.WriteString("  }\r\n")
+	script.WriteString("} finally {\r\n")
+	script.WriteString("  if ($revokeAskPassURL) { try { Invoke-WebRequest -UseBasicParsing -Method Post -Uri $revokeAskPassURL | Out-Null } catch {} }\r\n")
+	script.WriteString("  Remove-Item Env:\\SSH_ASKPASS -ErrorAction SilentlyContinue\r\n")
+	script.WriteString("  Remove-Item Env:\\SSH_ASKPASS_REQUIRE -ErrorAction SilentlyContinue\r\n")
+	script.WriteString("  Remove-Item Env:\\DISPLAY -ErrorAction SilentlyContinue\r\n")
+	script.WriteString("  Remove-Item Env:\\FLOE_ASKPASS_URL -ErrorAction SilentlyContinue\r\n")
+	script.WriteString("  Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue\r\n")
+	script.WriteString("}\r\n")
 	if _, err := io.WriteString(file, script.String()); err != nil {
 		_ = file.Close()
 		_ = os.Remove(path)
@@ -302,6 +362,10 @@ func (s *Server) writeSSHScript(askPassURL string, sshArgs []string) (string, er
 		return "", err
 	}
 	return path, nil
+}
+
+func powerShellSingleQuoted(value string) string {
+	return strings.ReplaceAll(value, "'", "''")
 }
 
 func startWindowsTerminal(args []string) error {

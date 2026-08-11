@@ -25,7 +25,7 @@ func TestBuildTerminalArgs(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			args, err := buildTerminalArgs(test.request, "root@example", `C:\Floe\ssh.ps1`, `C:\Program Files\PowerShell\7\pwsh.exe`)
+			args, err := buildTerminalArgs(test.request, "生产服务器", `C:\Floe\ssh.ps1`, `C:\Program Files\PowerShell\7\pwsh.exe`)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -34,6 +34,9 @@ func TestBuildTerminalArgs(t *testing.T) {
 			}
 			if got := args[len(args)-2:]; !reflect.DeepEqual(got, []string{"-File", `C:\Floe\ssh.ps1`}) {
 				t.Fatalf("PowerShell arguments end with %#v", got)
+			}
+			if !containsSequence(args, []string{"--title", "生产服务器"}) {
+				t.Fatalf("PowerShell arguments do not include terminal title: %#v", args)
 			}
 		})
 	}
@@ -61,9 +64,25 @@ func TestAskPassTokenIsLoopbackAndSingleUse(t *testing.T) {
 	}
 }
 
+func TestTerminalAskPassTokenIsReusableUntilRevoked(t *testing.T) {
+	server := &Server{askPassTokens: make(map[string]askPassSecret)}
+	server.origin = "http://127.0.0.1:32100"
+	token, _ := server.issueTerminalAskPass("s3cret")
+	for index := 0; index < 2; index++ {
+		password, ok := server.consumeAskPass(token)
+		if !ok || password != "s3cret" {
+			t.Fatalf("consume #%d = %q, %v", index+1, password, ok)
+		}
+	}
+	server.revokeAskPass(token)
+	if password, ok := server.consumeAskPass(token); ok || password != "" {
+		t.Fatalf("revoked token returned %q, %v", password, ok)
+	}
+}
+
 func TestSSHArgumentsAreEmbeddedInScript(t *testing.T) {
 	server := &Server{dataDir: t.TempDir()}
-	scriptPath, err := server.writeSSHScript("", []string{"-o", "StrictHostKeyChecking=accept-new", "-p", "2222", "user's@host"})
+	scriptPath, err := server.writeSSHScript("生产服务器", "http://localhost:32100/askpass/token", []string{"-o", "StrictHostKeyChecking=accept-new", "-p", "2222", "user's@host"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,9 +92,41 @@ func TestSSHArgumentsAreEmbeddedInScript(t *testing.T) {
 	}
 	script := string(data)
 	want := "$sshArgs = @('-o', 'StrictHostKeyChecking=accept-new', '-p', '2222', 'user''s@host')"
-	if !strings.Contains(script, want) || !strings.Contains(script, "& ssh.exe @sshArgs") {
-		t.Fatalf("generated script = %q", script)
+	for _, fragment := range []string{
+		want,
+		"$Host.UI.RawUI.WindowTitle = '生产服务器'",
+		"& ssh.exe @sshArgs",
+		"Write-Host '按 R 立即重连；按 Enter、Esc 或其他键结束。' -NoNewline",
+		"$key = [Console]::ReadKey($true)",
+		"if ($key.Key -ne [ConsoleKey]::R) { break }",
+		"$revokeAskPassURL = 'http://localhost:32100/askpass/token/revoke'",
+		"Invoke-WebRequest -UseBasicParsing -Method Post -Uri $revokeAskPassURL",
+		"Remove-Item Env:\\SSH_ASKPASS",
+	} {
+		if !strings.Contains(script, fragment) {
+			t.Fatalf("generated script does not contain %q: %q", fragment, script)
+		}
 	}
+}
+
+func TestTerminalTitlePrefersSessionName(t *testing.T) {
+	title := terminalTitle(core.ConnectRequest{Name: "airych.xyz"}, core.ConnectionTarget{User: "root", Host: "airych.xyz"})
+	if title != "airych.xyz" {
+		t.Fatalf("terminal title = %q", title)
+	}
+	fallback := terminalTitle(core.ConnectRequest{}, core.ConnectionTarget{User: "root", Host: "airych.xyz"})
+	if fallback != "root@airych.xyz" {
+		t.Fatalf("fallback title = %q", fallback)
+	}
+}
+
+func containsSequence(items, sequence []string) bool {
+	for i := 0; i+len(sequence) <= len(items); i++ {
+		if reflect.DeepEqual(items[i:i+len(sequence)], sequence) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBuildSSHArgsIncludesOptionalKeepAlive(t *testing.T) {
