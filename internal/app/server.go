@@ -1091,13 +1091,30 @@ func (s *Server) ensureTemplateProvider(ref templateProviderReference, role stri
 	if ref.Kind == "" && strings.HasPrefix(ref.ID, "local-") {
 		ref.Kind = "local"
 	}
-	if ref.Kind == "local" && ref.Location == "" && filepath.IsAbs(ref.Path) {
-		ref.Location = string(filepath.Separator)
+	if ref.Kind == "local" && ref.Location == "" {
+		ref.Location = inferLocalTemplateRoot(ref.Path)
 	}
-	if ref.Kind == "local" || ref.Location != "" && strings.HasPrefix(ref.ID, "local-") {
+	if ref.Kind == "local" {
 		return s.ensureLocalTemplateProvider(ref, role)
 	}
 	return s.ensureTransferProvider(ref.ID, role)
+}
+
+func inferLocalTemplateRoot(providerPath string) string {
+	providerPath = strings.TrimSpace(providerPath)
+	if providerPath == "" {
+		return ""
+	}
+	if runtime.GOOS == "windows" {
+		normalized := strings.ReplaceAll(providerPath, "\\", "/")
+		if normalized == "/home" || strings.HasPrefix(normalized, "/home/") {
+			return `\\wsl.localhost\Ubuntu\`
+		}
+	}
+	if filepath.IsAbs(providerPath) {
+		return string(filepath.Separator)
+	}
+	return ""
 }
 
 func (s *Server) ensureLocalTemplateProvider(ref templateProviderReference, role string) error {

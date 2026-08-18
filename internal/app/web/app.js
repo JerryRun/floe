@@ -2195,8 +2195,13 @@ async function runTransferTemplate(id) {
   if (!id) return;
   const template = state.transferTemplates.find((item) => item.id === id);
   if (!template) return;
-  const providerIDs = new Set((template.tasks || []).flatMap((item) => [item.source_provider, item.target_provider]).filter(Boolean));
-  for (const providerID of providerIDs) {
+  const providers = new Map();
+  for (const item of template.tasks || []) {
+    if (item.source_provider) providers.set(item.source_provider, item.source_provider_kind || "");
+    if (item.target_provider) providers.set(item.target_provider, item.target_provider_kind || "");
+  }
+  for (const [providerID, templateKind] of providers) {
+    if (templateKind === "local" || providerID.startsWith("local-")) continue;
     const provider = providerByID(providerID);
     if (provider?.kind !== "local" && !provider?.connected) {
       if (!await connectSavedSession(providerID)) return;

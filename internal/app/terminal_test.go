@@ -90,6 +90,9 @@ func TestSSHArgumentsAreEmbeddedInScript(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !bytes.HasPrefix(data, []byte{0xEF, 0xBB, 0xBF}) {
+		t.Fatalf("generated script does not start with UTF-8 BOM: % x", data[:min(len(data), 3)])
+	}
 	script := string(data)
 	want := "$sshArgs = @('-o', 'StrictHostKeyChecking=accept-new', '-p', '2222', 'user''s@host')"
 	for _, fragment := range []string{

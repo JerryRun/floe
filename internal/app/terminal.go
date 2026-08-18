@@ -307,6 +307,7 @@ func (s *Server) writeSSHScript(title, askPassURL string, sshArgs []string) (str
 		return "", err
 	}
 	var script strings.Builder
+	script.WriteString("\uFEFF")
 	script.WriteString("$ErrorActionPreference = 'Stop'\r\n")
 	if title != "" {
 		script.WriteString("$Host.UI.RawUI.WindowTitle = '")

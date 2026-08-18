@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"floe/internal/core"
@@ -154,5 +155,17 @@ func TestRunTransferTemplateRestoresSavedLocalProvider(t *testing.T) {
 	}
 	if string(data) != "jar" {
 		t.Fatalf("target content = %q", data)
+	}
+}
+
+func TestInferLocalTemplateRootForLegacyWSLPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		if got := inferLocalTemplateRoot("/home/chensj/projects/app/file.jar"); got != `\\wsl.localhost\Ubuntu\` {
+			t.Fatalf("legacy WSL root = %q", got)
+		}
+		return
+	}
+	if got := inferLocalTemplateRoot("/home/chensj/projects/app/file.jar"); got != string(filepath.Separator) {
+		t.Fatalf("legacy POSIX root = %q", got)
 	}
 }
