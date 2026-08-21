@@ -1,54 +1,221 @@
-# Floe
+# Floe — Server File Workspace for Windows
 
-Floe 是一个由本地 Go Core 驱动的浏览器文件工作台。当前体验版支持：
+<p align="center">
+  <strong>Move and manage files across servers—from one Windows workspace.</strong>
+</p>
 
-- 分组会话树、双文件面板、多本地/远程标签和双向拖放传输。
-- 会话先保存后连接；支持 SFTP 和 FTP，SFTP 首次连接显示并确认主机 SHA-256 指纹。
-- 会话右键可查看、修改或删除配置；修改已连接会话后会断开旧连接，下次打开时使用新配置连接。
-- 会话密码由本机随机 AES-GCM 密钥加密后保存在用户数据目录，不写入明文。
-- 跨提供者自适应分块、多路并发传输；SFTP 单文件使用内部请求流水线，目录任务按 Provider 能力控制并发。
-- Local/FTP 任务先写隔离的 `.floe-part-*` 临时文件；SFTP 保持兼容性更高的直接路径模式。写入完成后逐块使用远端 SHA-256 或回读校验，再提交任务。
-- 可调高度的任务区，按队列、成功和失败分类，支持暂停、恢复、删除和清空历史。
-- 传输队列分别显示源端读取速度和目标端写入速度；重试产生的实际 I/O 也会计入统计。
-- 上传前可选择覆盖、跳过、仅源文件更新时覆盖、自动重命名或逐个询问；跳过的任务会保留在成功历史中并标记为“已跳过”。
-- 传输选项可保存为模板，模板不包含密码或私钥，支持来源/目标会话、冲突策略、并发、校验、目录结构和过滤规则。
-- 内置实时操作日志，持久化连接、目录读取、传输和媒体播放错误的详细原因。
-- 底部任务区提供“速查”工作台，可用 `Ctrl+K` 随时搜索或记录命令、地址、账号和操作说明；
-  支持智能短语与双引号精确搜索、按命中位置加载统一上下文、原始记录编辑、选中文字复制、
-  敏感字段隐藏、长内容全屏阅读，以及文本/Markdown 文件导入。
-- 速查内容使用独立 AES-GCM 密钥加密保存；可在“位置”中指定知识库存储目录，选择复制
-  当前知识库后切换，或直接打开目标目录中已有的知识库。
-- UTF-8 远程文本预览与编辑，支持语法高亮、行号、查找替换、行列跳转、未保存提示、
-  UTF-8 BOM 与 LF/CRLF 保持、窗口内全屏、冲突检测和原子保存；Markdown 文件可打开
-  左侧源码、右侧渲染文档的实时分屏预览；HTML 文件支持实时页面渲染、设备尺寸调整
-  和右侧预览全屏。
-- 图片预览支持缩放、窗口内全屏和前后切换；列表与超大图标视图均支持图片缩略图。
-- MP4 直接播放；使用内置 hls.js 播放 M3U8/HLS，并代理同一 Provider 中的相对分片、子播放列表和密钥文件。
-- Windows 本地标签可从盘符目录树选择路径，并可创建多个本地标签。
-- 由 Go Core 调用 Windows Terminal，可将 SSH 打开到新标签、当前标签窗格或指定标签窗格。
-- SSH 可通过一次性、短时有效的 AskPass 令牌自动输入会话中保存的密码；密码不进入 PowerShell 命令或进程参数。
-- Core 已验证过主机指纹后，Windows OpenSSH 会以 `accept-new` 写入首次出现的主机密钥；已记录主机的密钥变化仍会被拒绝。
-- 同一 `Floe.exe` 通过 `floe ctl` 提供会话管理、目录、文本读取、日志以及本地/跨服务器并发校验传输，不要求浏览器 UI 正在运行。
-- 原生 Windows 托盘菜单和单实例保护，Windows 版不显示 CMD 窗口。
-- 托盘可配置启动时是否自动打开浏览器，设置保存在 `settings.json`。
+<p align="center">
+  Windows 上的多服务器文件工作台。<br>
+  在一个窗口中管理本地与远程文件，从服务器 A 向服务器 B 传输文件，编辑和预览远程内容，并随时打开 SSH Terminal。
+</p>
 
-## 界面预览
+<p align="center">
+  <a href="https://github.com/JerryRun/floe/releases/latest/download/Floe.exe"><strong>Download Floe for Windows</strong></a>
+  ·
+  <a href="https://github.com/JerryRun/floe/releases/latest">Release Notes</a>
+  ·
+  <a href="#quick-start">Quick Start</a>
+</p>
 
-### 双面板与传输队列
+<p align="center">
+  Windows x64 · Portable · No installation required · Open source
+</p>
 
-![Floe 双面板与传输队列](docs/screenshots/floe-main.png)
+Floe 面向在 Windows 上管理 Linux 服务器、支持 SFTP/FTP 的 NAS 和远程文件的开发者与运维人员。左右两侧可以分别打开本地目录或不同服务器，在同一个工作流中完成浏览、传输、校验、编辑、预览和 SSH 操作，不必反复切换文件管理器、终端和编辑器。
 
-### 发布任务模板
+![使用 Floe 在 Build Server 和 Production Server 之间传输并校验文件](docs/demo/floe-server-to-server.gif)
+
+> 从服务器 A 到服务器 B，一次完成，无需手动先下载到本地再重新上传。传输由 Windows 上运行的 Floe 协调和执行。
+
+## Why Floe?
+
+### Server → Server
+
+在左右面板中打开两台服务器，拖动文件或目录即可创建跨服务器传输任务。传输过程统一显示源端读取速度、目标端写入速度、进度、校验进度和预计剩余时间。
+
+### Remote File Workspace
+
+同时管理本地目录、SFTP 和 FTP 会话。远程文件可以直接打开、查找、编辑和预览，不需要每次先下载、修改后再上传。
+
+### SSH + File Management
+
+从当前 SFTP 会话一键打开 Windows Terminal。可以选择新标签、右侧窗格或下方窗格，让文件操作和服务器命令保持在同一工作流中。
+
+## Built for reliable transfers
+
+- **完成前校验**：写入完成后使用远端 SHA-256 或回读校验，确认内容一致后完成任务。
+- **暂停与恢复**：传输队列支持暂停、恢复、删除和分类查看历史任务。
+- **冲突处理**：支持覆盖、跳过、仅源文件更新时覆盖、自动重命名或逐个询问。
+- **主机指纹确认**：首次连接 SFTP 服务器时显示并确认 SHA-256 主机指纹，已记录主机的密钥变化会被拒绝。
+- **本地凭据加密**：会话密码和速查内容使用本机随机 AES-GCM 密钥加密保存，不写入明文。
+- **可追踪错误**：操作日志记录连接、目录读取、传输、编辑和媒体播放错误的具体原因。
+
+## Product preview
+
+### 双面板文件工作区
+
+本地目录和远程服务器可以自由放置在左右面板。支持多个本地或远程标签、目录书签、多文件选择和双向拖放。
+
+![Floe 双面板文件工作区与传输队列](docs/screenshots/floe-main.png)
+
+### 可重复执行的发布任务
+
+将来源、目标、过滤规则、目录结构、并发、校验和冲突策略保存为模板，重复执行常用发布或备份流程。模板不包含密码或私钥。
 
 ![Floe 发布任务模板](docs/screenshots/floe-publish.png)
 
-### 文件冲突处理
+### 明确的文件冲突处理
+
+目标文件已存在时，先比较来源和目标信息，再选择覆盖、跳过、仅更新时覆盖或自动重命名，也可以将选择应用到本批次后续冲突。
 
 ![Floe 文件冲突处理](docs/screenshots/floe-conflict.png)
 
 截图使用匿名演示数据，不包含真实服务器、账号或用户文件。
 
-## 从源码运行
+<a id="quick-start"></a>
+
+## 5 分钟快速开始
+
+### 1. 下载
+
+下载最新的 Windows x64 便携版：
+
+**[Download Floe.exe](https://github.com/JerryRun/floe/releases/latest/download/Floe.exe)**
+
+无需安装，也不要求 Windows 主机预先安装 Go。你可以同时下载 **[SHA256SUMS.txt](https://github.com/JerryRun/floe/releases/latest/download/SHA256SUMS.txt)** 校验文件完整性。
+
+### 2. 启动工作区
+
+双击 `Floe.exe`。Floe Core 会在本机启动，并自动打开文件工作区。关闭工作区页面不会停止 Core，可以通过系统托盘重新打开或退出 Floe。
+
+### 3. 添加服务器
+
+点击左侧服务器区域的 `+`，填写会话名称、协议、地址、端口和登录信息。首次连接 SFTP 主机时，请通过服务器控制台或管理员提供的信息核对 SHA-256 主机指纹。
+
+### 4. 打开第二个位置
+
+在另一侧打开本地目录、另一台服务器或支持 SFTP/FTP 的 NAS。左右两侧可以是以下任意组合：
+
+```text
+Local   ↔ Server
+Server  ↔ Server
+Server  ↔ NAS
+```
+
+### 5. 开始传输
+
+选择文件或目录并拖动到另一侧，或使用面板工具栏中的上传/下载按钮。Floe 会创建传输任务，并显示读取、写入和校验进度。
+
+## What you can do
+
+### 管理多台服务器
+
+- 使用分组会话树保存和整理 SFTP、FTP 与本地位置。
+- 在左右两侧创建多个本地或远程标签。
+- 使用目录书签快速返回服务器上的常用路径。
+- 修改已保存会话；已连接会话会安全断开，并在下次打开时使用新配置。
+
+### 传输文件和目录
+
+- 在本地、SFTP 和 FTP Provider 之间传输文件或目录。
+- 使用自适应分块、请求流水线和 Provider 能力控制并发。
+- 分别显示源端读取速度和目标端写入速度，重试产生的实际 I/O 也计入统计。
+- 保存传输模板，用于重复执行发布、备份和同步任务。
+- 任务恢复根据保存的来源与目标会话自动连接，不依赖文件面板当前是否打开会话。
+
+### 编辑和预览远程文件
+
+- 预览和编辑 UTF-8 文本，支持语法高亮、行号、查找替换和行列跳转。
+- 保持 UTF-8 BOM、LF/CRLF，保存前检测远端冲突并使用原子写入。
+- 使用源码与渲染结果分屏预览 Markdown。
+- 实时渲染 HTML，并调整预览设备尺寸。
+- 查看 PNG、JPEG、GIF 等图片，支持缩放、前后切换和缩略图。
+- 播放 MP4，并使用内置 hls.js 播放同一 Provider 中的 M3U8/HLS 内容。
+
+### 连接 SSH Terminal
+
+- 在 Windows Terminal 新标签、右侧窗格或下方窗格打开当前 SFTP 会话。
+- 使用一次性、短时有效的 AskPass 令牌输入已保存密码。
+- 密码不会出现在 PowerShell 命令或进程参数中。
+- Core 确认主机指纹后，Windows OpenSSH 使用 `accept-new` 记录首次出现的主机密钥。
+
+### 保存服务器知识
+
+- 使用 `Ctrl+K` 搜索或记录命令、地址、账号和操作说明。
+- 支持智能短语、双引号精确搜索、上下文查看、敏感字段隐藏和全文编辑。
+- 导入文本或 Markdown 文件，并将加密知识库移动到自定义目录。
+
+### 使用命令行
+
+GUI 与 `floe ctl` 共用同一个 `Floe.exe`。CLI 可以在浏览器工作区未打开时管理会话、读取目录和文本、查看日志，以及执行本地或跨服务器传输。
+
+```powershell
+.\Floe.exe ctl version
+.\Floe.exe ctl help
+.\Floe.exe ctl sessions
+.\Floe.exe ctl session show <会话ID>
+.\Floe.exe ctl session add --name build --host 192.0.2.10 --user root --password-stdin
+.\Floe.exe ctl session update <会话ID> --keepalive --alive-interval 60 --alive-count 3
+.\Floe.exe ctl session delete <会话ID>
+
+# 服务器下载到本地
+.\Floe.exe ctl get -j 4 <会话ID> /remote/file.bin C:\Downloads\file.bin
+
+# 本地上传到服务器
+.\Floe.exe ctl put -j 4 C:\build\file.bin <会话ID> /release/file.bin
+
+# 在两个服务器之间创建一次传输工作流
+.\Floe.exe ctl get -j 4 <源会话ID> /remote/file.bin <目标会话ID> /remote/copy/file.bin
+.\Floe.exe ctl put -j 4 <源会话ID> /release/source.bin <目标会话ID> /release/file.bin
+
+.\Floe.exe ctl logs --limit 100
+.\Floe.exe ctl logs clear
+```
+
+首次通过 CLI 连接尚未信任的 SFTP 主机时，Floe 会显示 SHA-256 主机指纹并要求确认。`get` 和 `put` 复用 GUI 的传输引擎，完成前逐块回读并核对 SHA-256。如果已把 Floe 所在目录加入 `PATH`，命令可简写为 `floe ctl ...`。
+
+## Security and local data
+
+Floe 的工作区由本机 Core 提供，运行数据默认保存在 `%LOCALAPPDATA%\Floe`，不要求注册账号或连接 Floe 云服务。
+
+| 文件 | 内容 |
+| --- | --- |
+| `sessions.json` | 已保存的服务器会话 |
+| `session.key` | 会话凭据的本地加密密钥 |
+| `tasks.json` | 传输任务与恢复信息 |
+| `activity.json` | 最多 1000 条操作日志 |
+| `transfer-templates.json` | 发布和传输模板 |
+| `settings.json` | 启动和知识库位置设置 |
+| `memories.json` / `memory.key` | 加密的速查内容及密钥 |
+
+速查知识库可以移动到自定义目录。Floe 支持复制当前知识库后切换，也可以直接打开目标目录中已有的知识库。
+
+## Current limitations
+
+Floe 仍处于早期版本，当前边界包括：
+
+- 当前提供 Windows x86_64 构建，产品界面以中文为主。
+- 单次目录任务最多递归 2000 个文件。
+- SFTP 上传、下载和 FTP 下载支持多路并发；为兼容不同服务器，SFTP 上传限制为一个写入槽，但单文件仍使用内部请求流水线。
+- 标准 FTP 不保证对同一文件进行随机并发写入，因此 FTP 上传使用单条顺序数据流。
+- FTP 控制连接每 15 秒发送保活命令；连接失效后，下一次目录、状态或写入操作会自动重新登录并安全重试一次。
+- 单次网络读写空闲超过 20 秒会结束并返回明确错误，避免任务永久卡住。
+- 私钥口令可以保存在会话中或通过 CLI 的 `--password-stdin` 提供，但尚未接入 Windows Credential Manager。
+- SFTP 目标优先在远端计算分块 SHA-256；服务器不支持远程哈希时，Floe 会回读分块完成校验。
+- PNG、JPEG 和 GIF 可以生成缩略图，其他图片格式显示标准图片图标。
+- M3U8 中同一 Provider 的相对资源由 Floe 读取；外部 HTTP 地址仍可能受到来源服务器 CORS 和 Floe 安全策略限制。
+
+更完整的协议对比、故障模型、验收指标和基准命令见 [`docs/transfer-review.md`](docs/transfer-review.md)。Windows Terminal 集成说明见 [`docs/terminal-integration-review.md`](docs/terminal-integration-review.md)。
+
+## Optional: install as an Edge app
+
+Floe 启动后在本机提供工作区。需要独立窗口和任务栏图标时，可以在 Microsoft Edge 中打开 Floe，然后选择“应用”→“将此站点作为应用安装”。
+
+安装完成后，可以在 Floe 托盘菜单中关闭“启动时打开浏览器”，以后通过 Edge 应用快捷方式打开界面。需要时仍可从托盘菜单重新打开工作区、打开 PowerShell 或退出程序。
+
+## Build from source
+
+### 本地运行
 
 ```bash
 cd floe
@@ -64,104 +231,52 @@ GOPATH="$PWD/.cache/gopath" GOCACHE="$PWD/.cache/go-build" \
 
 终端会输出一次性登录地址，将其复制到 Windows 浏览器即可。
 
-## 构建 Windows x86_64
+### 构建 Windows x86_64
 
 ```bash
 chmod +x build-windows.sh
 ./build-windows.sh
 ```
 
-产物位于 `dist/Floe.exe`。GUI 与 `floe ctl` 共用同一可执行文件；Windows 宿主机不需要安装 Go，
-也不会生成 `Floe-new.exe`。
+产物位于 `dist/Floe.exe`。Windows 版本使用 GUI 子系统，不会显示 CMD 窗口，也不会生成 `Floe-new.exe`。
 
-Windows 版本使用 GUI 子系统，不会打开 CMD 窗口。关闭浏览器不会停止 Core；
-可通过 Floe 托盘图标重新打开页面、打开 PowerShell 或退出程序。
-
-### 使用 Edge 创建独立应用窗口
-
-Floe 启动后会在本机提供 Web UI：\`http://localhost:7577\`。如果希望像桌面软件
-一样使用，可以在 Microsoft Edge 中打开该地址，然后选择地址栏右侧的“应用”菜单
-（或 \`…\` 菜单中的“应用”）→“将此站点作为应用安装”。之后可直接从开始菜单或
-桌面快捷方式启动 Floe，拥有独立窗口和任务栏图标。
-
-安装完成后，建议在 Floe 托盘菜单中关闭“启动时打开浏览器”。这样 Floe 只负责
-启动本地 Core，日后通过 Edge 应用快捷方式打开界面；需要时仍可从托盘菜单重新
-打开浏览器。
-
-图标源文件为 `assets/floe-source.png`。修改图标后运行：
+修改 `assets/floe-source.png` 后，可以重新生成 Windows 资源并构建：
 
 ```bash
 ./generate-resources.sh
 ./build-windows.sh
 ```
 
-启动后数据默认保存在 `%LOCALAPPDATA%\Floe`。会话保存在 `sessions.json`，
-加密密钥保存在 `session.key`，传输任务保存在 `tasks.json`，操作日志保存在
-`activity.json`（最多保留 1000 条），传输模板保存在 `transfer-templates.json`，
-启动偏好保存在 `settings.json`。
-速查知识库默认保存在同一目录下的 `memories.json`，加密密钥为 `memory.key`；在速查工具栏
-中修改存储位置后，这两个文件保存在指定目录，路径记录在 `settings.json`。
+### 重新生成 README 演示素材
 
-## 命令行
+演示素材来自真实 Floe Web UI。需要 Windows、Microsoft Edge、PowerShell 和 WSL 中的 `ffmpeg`：
 
-```powershell
-.\Floe.exe ctl version
-.\Floe.exe ctl help
-.\Floe.exe ctl logs --limit 100
-.\Floe.exe ctl sessions
-.\Floe.exe ctl session show <会话ID>
-.\Floe.exe ctl session add --name build --host 192.0.2.10 --user root --password-stdin
-.\Floe.exe ctl session update <会话ID> --keepalive --alive-interval 60 --alive-count 3
-.\Floe.exe ctl session delete <会话ID>
+```bash
+GOCACHE="$PWD/.cache/go-build" GOPATH="$PWD/.cache/gopath" \
+  CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+  go build -buildvcs=false -trimpath \
+  -o .cache/floe-readme-demo-server.exe ./tools/readme-demo-server
 
-# 服务器下载到本地
-.\Floe.exe ctl get -j 4 <会话ID> /remote/file.bin C:\Downloads\file.bin
+powershell.exe -NoProfile -ExecutionPolicy Bypass \
+  -File "$(wslpath -w "$PWD/tools/start-readme-demo.ps1")" \
+  -ServerExecutable "$(wslpath -w "$PWD/.cache/floe-readme-demo-server.exe")"
 
-# 本地上传到服务器
-.\Floe.exe ctl put -j 4 C:\build\file.bin <会话ID> /release/file.bin
+powershell.exe -NoProfile -ExecutionPolicy Bypass \
+  -File "$(wslpath -w "$PWD/tools/capture-readme-demo.ps1")" \
+  -BootstrapURL "http://localhost:7581/"
 
-# 两个服务器之间直接传输；get 和 put 均接受相同的四参数形式
-.\Floe.exe ctl get -j 4 <源会话ID> /remote/file.bin <目标会话ID> /remote/copy/file.bin
-.\Floe.exe ctl put -j 4 <源会话ID> /release/source.bin <目标会话ID> /release/file.bin
-
-.\Floe.exe ctl logs clear
+./tools/build-readme-demo.sh
 ```
 
-首次通过 CLI 连接尚未信任的 SFTP 主机时，会显示 SHA-256 主机指纹并要求确认。
-`get`/`put` 复用 GUI 的传输引擎，完成前逐块回读并核对 SHA-256。
-如果已把 Floe 所在目录加入 `PATH`，命令可简写为 `floe ctl ...`。
+## Feedback
 
-## 当前体验版边界
+Floe 现在最需要的不是更多功能，而是真实服务器工作流中的反馈。如果你遇到连接失败、传输异常、兼容性问题，或者 Floe 没有解决你的日常任务，请在 [GitHub Issues](https://github.com/JerryRun/floe/issues) 中告诉我们：
 
-传输方案的协议对比、故障模型、验收指标和基准命令见
-[`docs/transfer-review.md`](docs/transfer-review.md)。
+- 你通常管理什么类型的服务器或 NAS？
+- 你想在什么位置之间传输文件？
+- 哪一步让你无法继续使用？
+- 你现在使用什么工具完成这项工作？
 
-- 文件和目录都可跨 Provider 传输；单次目录任务最多递归 2000 个文件。
-- SFTP 上传、下载以及 FTP 下载支持多路并发。SFTP 上传按服务器兼容性限制为单个
-  写入槽，但单文件仍使用内部请求流水线；标准 FTP 不保证对同一文件的随机并发写入，
-  因此 FTP 上传保持单条顺序数据流，目录任务按 Provider 能力控制并发。
-- FTP 控制连接每 15 秒发送保活命令；服务端或 NAT 清除空闲连接后，下一次目录、
-  文件状态或写入操作会自动重新登录并安全重试一次。单次网络读写空闲超过 20 秒
-  会结束并返回明确错误，避免永久卡住。
-- 私钥口令可通过会话保存或 CLI 的 `--password-stdin` 提供；当前会话密钥由 Floe
-  本地文件保护，尚未接入 Windows Credential Manager。
-- SFTP 目标优先在远端计算分块 SHA-256；目标不支持远程哈希时自动回读分块校验，
-  并缓存远端不支持状态避免重复探测。
-- PNG、JPEG、GIF 在超大图标视图生成缩略图；其他图片格式显示标准图片图标。
-- 任务恢复会根据任务保存的源、目标会话 ID 自动连接，不依赖左右文件面板是否打开会话。
-- M3U8 中相对 URI 会通过当前 Provider 读取；引用外部 HTTP 地址时仍受来源服务器 CORS 和 Floe 安全策略限制。
+## License
 
-## 开源与第三方组件
-
-Floe 源码使用 [Apache License 2.0](LICENSE) 发布。依赖与内嵌资源的许可证清单见
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。运行数据保存在源码目录之外，`.gitignore`
-也会排除常见的会话、密钥、日志、任务和构建产物。
-
-- hls.js 1.6.13，Apache-2.0。许可证见
-  `internal/app/web/assets/vendor/HLS.js-LICENSE.txt`。
-- Google Material Symbols，Apache-2.0。许可证见
-  `internal/app/web/assets/material-symbols-LICENSE.txt`。
-- marked 15.0.12，MIT。许可证见
-  `internal/app/web/assets/vendor/MARKED-LICENSE.md`。
-- DOMPurify 3.2.6，Apache-2.0 或 MPL-2.0。许可证见
-  `internal/app/web/assets/vendor/DOMPURIFY-LICENSE.txt`。
+Floe 使用 [Apache License 2.0](LICENSE) 发布。第三方依赖与内嵌资源的许可证清单见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。

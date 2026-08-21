@@ -1,0 +1,53 @@
+name: Workflow feedback
+description: 告诉我们 Floe 是否解决了你的真实服务器文件工作
+title: "[Feedback] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Floe 当前最需要的是真实使用反馈。即使你最终没有继续使用，原因也非常有价值。
+
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: 你的使用结果
+      options:
+        - 已经在日常工作中重复使用
+        - 完成了一次真实任务
+        - 下载并试用，但遇到阻塞
+        - 看过 README，但没有下载
+    validations:
+      required: true
+
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 你想完成什么任务？
+      placeholder: 在构建服务器和生产服务器之间发布模型文件，并在完成后打开 SSH 检查服务。
+    validations:
+      required: true
+
+  - type: input
+    id: current_tools
+    attributes:
+      label: 你原来使用什么工具？
+      placeholder: WinSCP + Windows Terminal + VS Code
+
+  - type: textarea
+    id: useful
+    attributes:
+      label: Floe 哪部分最有用？
+
+  - type: textarea
+    id: blocker
+    attributes:
+      label: 哪一步阻止你继续使用？
+      description: 如果没有阻塞，可以填写“无”。
+    validations:
+      required: true
+
+  - type: textarea
+    id: missing
+    attributes:
+      label: 下一步最应该改进什么？
+      description: 请优先描述任务结果，而不是只写一个功能名称。

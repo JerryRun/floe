@@ -1,0 +1,86 @@
+name: Bug report
+description: 报告阻止连接、浏览、传输、编辑或 SSH 工作流的问题
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你帮助改进 Floe。提交前请删除截图和日志中的密码、私钥、Token、主机指纹及真实服务器地址。
+
+  - type: input
+    id: version
+    attributes:
+      label: Floe 版本
+      description: 可运行 `Floe.exe ctl version` 查看。
+      placeholder: v0.5.0
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: workflow
+    attributes:
+      label: 出现问题的工作流
+      options:
+        - 连接 SFTP/FTP 服务器
+        - 浏览本地或远程目录
+        - Local ↔ Server 传输
+        - Server ↔ Server 传输
+        - 文件编辑或预览
+        - Windows Terminal / SSH
+        - 传输模板
+        - Ctrl+K 速查
+        - floe ctl
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 请从启动 Floe 或打开会话开始，列出最短复现路径。
+      placeholder: |
+        1. 打开 Build Server
+        2. 在另一侧打开 Production Server
+        3. 将目录拖到右侧
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      description: 可以附加经过脱敏的错误信息或日志片段。
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 服务器与网络环境
+      description: 不要填写真实公网地址。请说明协议、服务器系统、认证方式、是否经过 VPN/NAT/代理等。
+      placeholder: SFTP / Ubuntu 24.04 / 私钥认证 / 公司 VPN
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私确认
+      options:
+        - label: 我已经删除密码、私钥、Token、主机指纹和真实服务器地址。
+          required: true

@@ -1,0 +1,27 @@
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+    authors:
+      - dependabot
+      - dependabot[bot]
+  categories:
+    - title: Highlights
+      labels:
+        - highlight
+        - breaking-change
+    - title: New workflows
+      labels:
+        - enhancement
+        - feature
+    - title: Reliability and fixes
+      labels:
+        - bug
+        - reliability
+        - security
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Other changes
+      labels:
+        - "*"

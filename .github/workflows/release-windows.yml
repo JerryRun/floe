@@ -60,5 +60,6 @@ jobs:
               dist/SHA256SUMS.txt \
               --verify-tag \
               --generate-notes \
+              --notes "$(cat .github/release-preamble.md 2>/dev/null || true)" \
               --title "Floe $RELEASE_TAG"
           fi
