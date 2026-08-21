@@ -42,6 +42,19 @@ func TestPreviewUIIsBundledAndSandboxed(t *testing.T) {
 	}
 }
 
+func TestMemoryWorkbenchUIIsBundled(t *testing.T) {
+	data, err := webFiles.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(data)
+	for _, marker := range []string{"memoryPanel", "memorySearch", "memoryFullscreen", "memorySettingsDialog"} {
+		if !strings.Contains(page, marker) {
+			t.Errorf("bundled memory UI does not contain %q", marker)
+		}
+	}
+}
+
 func TestServerUsesFriendlyLocalhostURL(t *testing.T) {
 	url, err := friendlyLoopbackOrigin("127.0.0.1:47667")
 	if err != nil {

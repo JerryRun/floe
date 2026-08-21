@@ -19,6 +19,24 @@ const state = {
   taskSelection: new Set(),
   logs: [],
   taskFilter: "queue",
+  memories: [],
+  memorySelected: "",
+  memoryLoaded: false,
+  memoryLoading: false,
+  memoryMode: "view",
+  memoryDraft: "",
+  memoryEditing: null,
+  memorySelectionText: "",
+  memoryLoadID: 0,
+  memoryContextLoadID: 0,
+  memoryContextLoading: false,
+  memoryBlocks: [],
+  memoryHasBefore: false,
+  memoryHasAfter: false,
+  memoryLoadingBefore: false,
+  memoryLoadingAfter: false,
+  memoryAnchor: "",
+  memorySettings: null,
   localTreeSide: "",
   bookmarkSide: "",
   terminalProvider: "",
@@ -38,6 +56,7 @@ const BOOKMARKS_STORAGE = "floe.bookmarks.v1";
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 let editorPreviewTimer = 0;
+let memorySearchTimer = 0;
 
 async function api(url, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -2001,7 +2020,7 @@ function refreshTasks(tasks) {
   const active = queue.filter((task) => ["running", "verifying"].includes(task.status)).length;
   if (active > 0) {
     $("#transferQueue").classList.remove("collapsed");
-    state.taskFilter = "queue";
+    if (state.taskFilter !== "memories") state.taskFilter = "queue";
   }
   $("#queueCount").textContent = queue.length;
   $("#successCount").textContent = success.length;
@@ -2097,10 +2116,548 @@ function taskCategory(task) {
   return "queue";
 }
 
+function memorySourceLabel(item) {
+  if (item.source === "import") return item.source_path ? `导入 · ${item.source_path}` : "导入内容";
+  if (item.source === "onenote") return item.source_path ? `OneNote · ${item.source_path}` : "OneNote";
+  return "Floe 随手记";
+}
+
+function maskSensitiveContent(content) {
+  let sensitive = false;
+  const text = content.replace(/((?:密码|口令|password|passwd|pwd)\s*[:=：]\s*)([^\s,，;；]+)/gi, (_, prefix) => {
+    sensitive = true;
+    return `${prefix}••••••••`;
+  });
+  return { text, sensitive };
+}
+
+function appendHighlightedText(node, text, query) {
+  const terms = memoryQueryHighlights(query);
+  if (!terms.length) {
+    node.textContent = text;
+    return;
+  }
+  const lower = text.toLowerCase();
+  let offset = 0;
+  while (offset < text.length) {
+    let nextIndex = -1;
+    let nextTerm = "";
+    for (const term of terms) {
+      const found = lower.indexOf(term, offset);
+      if (found >= 0 && (nextIndex < 0 || found < nextIndex)) {
+        nextIndex = found;
+        nextTerm = term;
+      }
+    }
+    if (nextIndex < 0) {
+      node.append(document.createTextNode(text.slice(offset)));
+      break;
+    }
+    if (nextIndex > offset) node.append(document.createTextNode(text.slice(offset, nextIndex)));
+    const mark = document.createElement("mark");
+    mark.textContent = text.slice(nextIndex, nextIndex + nextTerm.length);
+    node.append(mark);
+    offset = nextIndex + nextTerm.length;
+  }
+}
+
+function memoryQueryHighlights(query) {
+  const normalized = query.toLowerCase().replace(/[！-～]/g, (char) => String.fromCharCode(char.charCodeAt(0) - 0xfee0)).replace(/　/g, " ");
+  const phrases = [];
+  const plain = normalized.replace(/["“”]([^"“”]+)["“”]/g, (_, phrase) => {
+    const value = phrase.trim().replace(/\s+/g, " ");
+    if (value) phrases.push(value);
+    return " ";
+  });
+  const terms = plain.replace(/[,，;；。.!！?？、]/g, " ").split(/\s+/).filter(Boolean);
+  if (!phrases.length && terms.length > 1) phrases.push(terms.join(" "));
+  for (const phrase of phrases) terms.push(...phrase.split(/\s+/));
+  return [...new Set([...phrases, ...terms])].sort((left, right) => right.length - left.length);
+}
+
+function memoryMatchLabel(match) {
+  return { exact: "精确短语", phrase: "完整短语", all: "全部词", partial: "部分匹配" }[match] || "";
+}
+
+function renderMemoryEditor() {
+  hideMemorySelectionCopy();
+  const detail = $("#memoryDetail");
+  const editor = document.createElement("div");
+  editor.className = "memory-editor";
+  const head = document.createElement("div");
+  head.className = "memory-editor-head";
+  const title = document.createElement("strong");
+  title.textContent = state.memoryMode === "new" ? "随手记" : "编辑原始记录";
+  const hint = document.createElement("span");
+  hint.className = "memory-document-meta";
+  hint.textContent = state.memoryMode === "new"
+    ? "不需要标题或标签，第一行会作为摘要"
+    : `${memorySourceLabel(state.memoryEditing || {})} · Ctrl+Enter 保存`;
+  head.append(title, hint);
+  const textarea = document.createElement("textarea");
+  textarea.id = "memoryEditorInput";
+  textarea.placeholder = "输入任何需要记住的内容……";
+  textarea.value = state.memoryDraft;
+  textarea.addEventListener("input", () => { state.memoryDraft = textarea.value; });
+  textarea.addEventListener("keydown", (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+      event.preventDefault();
+      saveMemoryEditor();
+    }
+  });
+  const actions = document.createElement("div");
+  actions.className = "memory-editor-actions";
+  if (state.memoryMode === "edit" && state.memoryEditing) {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "danger memory-editor-delete";
+    remove.innerHTML = '<svg class="memory-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5m4-5v5"/></svg><span>删除整条记录</span>';
+    remove.addEventListener("click", deleteEditingMemory);
+    actions.append(remove);
+  }
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "取消";
+  cancel.addEventListener("click", closeMemoryEditor);
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "primary";
+  save.textContent = "保存记录";
+  save.addEventListener("click", saveMemoryEditor);
+  actions.append(cancel, save);
+  editor.append(head, textarea, actions);
+  detail.replaceChildren(editor);
+  requestAnimationFrame(() => textarea.focus());
+}
+
+function openMemoryEditor(mode, draft = "") {
+  state.memoryMode = mode;
+  state.memoryEditing = null;
+  state.memoryDraft = draft;
+  renderMemoryPanel();
+}
+
+async function editMemoryBlock(block) {
+  try {
+    const item = await api(`/api/v1/memories/${encodeURIComponent(block.memory_id)}`);
+    state.memoryEditing = { ...item, block_id: block.id, anchor_line: block.line };
+    state.memoryDraft = item.content;
+    state.memoryMode = "edit";
+    renderMemoryPanel();
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function closeMemoryEditor() {
+  state.memoryMode = "view";
+  state.memoryDraft = "";
+  state.memoryEditing = null;
+  renderMemoryPanel();
+}
+
+async function saveMemoryEditor() {
+  const content = state.memoryDraft.trim();
+  const editing = state.memoryMode === "edit" ? state.memoryEditing : null;
+  if (!content) {
+    if (editing) {
+      await deleteEditingMemory();
+      return;
+    }
+    toast("请输入需要记录的内容", "error");
+    return;
+  }
+  try {
+    const saved = await api(editing ? `/api/v1/memories/${encodeURIComponent(editing.id)}` : "/api/v1/memories", {
+      method: editing ? "PUT" : "POST",
+      body: JSON.stringify({ content, source: editing?.source, source_path: editing?.source_path }),
+    });
+    const returnLine = editing ? Math.min(editing.anchor_line, Math.max(0, saved.content.split("\n").length - 1)) : 0;
+    state.memoryMode = "view";
+    state.memoryDraft = "";
+    state.memoryEditing = null;
+    toast(editing ? "速查记录已更新" : "已记下");
+    await loadMemories($("#memorySearch").value);
+    if (editing) {
+      const candidates = state.memories.filter((item) => item.id === saved.id);
+      const target = candidates.sort((left, right) => Math.abs(left.anchor_line - returnLine) - Math.abs(right.anchor_line - returnLine))[0];
+      if (target) await selectMemory(target);
+      else await loadMemoryAnchor(`${saved.id}:${returnLine}`);
+    }
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function deleteEditingMemory() {
+  const editing = state.memoryEditing;
+  if (!editing || !confirm("确定删除这整条原始记录吗？此操作无法撤销。")) return;
+  try {
+    await api(`/api/v1/memories/${encodeURIComponent(editing.id)}`, { method: "DELETE" });
+    state.memoryMode = "view";
+    state.memoryDraft = "";
+    state.memoryEditing = null;
+    state.memorySelected = "";
+    state.memoryBlocks = [];
+    state.memoryAnchor = "";
+    state.memoryHasBefore = false;
+    state.memoryHasAfter = false;
+    toast("原始记录已删除");
+    await loadMemories($("#memorySearch").value);
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function hideMemorySelectionCopy() {
+  const button = $("#memorySelectionCopy");
+  button.hidden = true;
+  state.memorySelectionText = "";
+}
+
+function updateMemorySelectionCopy() {
+  const detail = $("#memoryDetail");
+  const selection = window.getSelection();
+  if (state.memoryMode !== "view" || !selection || selection.rangeCount === 0 || selection.isCollapsed
+      || !detail.contains(selection.anchorNode) || !detail.contains(selection.focusNode)) {
+    hideMemorySelectionCopy();
+    return;
+  }
+  const text = selection.toString().trim();
+  if (!text) {
+    hideMemorySelectionCopy();
+    return;
+  }
+  const rect = selection.getRangeAt(0).getBoundingClientRect();
+  const button = $("#memorySelectionCopy");
+  const width = 66;
+  let top = rect.top - 34;
+  if (top < 8) top = rect.bottom + 8;
+  button.style.left = `${Math.max(8, Math.min(window.innerWidth - width - 8, rect.left + rect.width / 2 - width / 2))}px`;
+  button.style.top = `${top}px`;
+  state.memorySelectionText = text;
+  button.hidden = false;
+}
+
+async function deleteSelectedMemory() {
+  const item = selectedMemory();
+  if (!item || !confirm(`删除“${item.title}”？`)) return;
+  try {
+    await api(`/api/v1/memories/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+    state.memorySelected = "";
+    toast("速查记录已删除");
+    await loadMemories($("#memorySearch").value);
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function toggleMemoryFullscreen(force) {
+  const queue = $("#transferQueue");
+  const enabled = force ?? !queue.classList.contains("memory-fullscreen");
+  queue.classList.toggle("memory-fullscreen", enabled);
+  const icon = $("#memoryFullscreen .material-symbols-rounded");
+  icon.textContent = enabled ? "close" : "fullscreen";
+  $("#memoryFullscreen").title = enabled ? "退出全屏" : "展开速查";
+}
+
+async function activateMemories() {
+  state.taskFilter = "memories";
+  const queue = $("#transferQueue");
+  queue.classList.remove("collapsed");
+  const mainArea = $(".main-area");
+  const currentHeight = parseInt(getComputedStyle(mainArea).getPropertyValue("--queue-height"), 10) || 0;
+  if (currentHeight < 260) mainArea.style.setProperty("--queue-height", "300px");
+  renderTaskList();
+  if (!state.memoryLoaded) await loadMemories();
+  requestAnimationFrame(() => $("#memorySearch").focus());
+}
+
+async function importMemoryFiles(files) {
+  const supported = [...files].filter((file) => file.size <= 1 << 20);
+  if (!supported.length) {
+    toast("请选择不超过 1 MB 的文本或 Markdown 文件", "error");
+    return;
+  }
+  let imported = 0;
+  for (const file of supported) {
+    try {
+      const content = await file.text();
+      if (!content.trim()) continue;
+      await api("/api/v1/memories", {
+        method: "POST",
+        body: JSON.stringify({ content, source: "import", source_path: file.name }),
+      });
+      imported++;
+    } catch (error) {
+      toast(`${file.name}：${error.message}`, "error");
+    }
+  }
+  if (imported) {
+    toast(`已导入 ${imported} 个文件；OneNote 直连导入将在后续版本提供`);
+    await loadMemories($("#memorySearch").value);
+  }
+}
+
+async function openMemorySettings() {
+  try {
+    const settings = await api("/api/v1/memory-settings");
+    state.memorySettings = settings;
+    const form = $("#memorySettingsForm");
+    form.elements.path.value = settings.path;
+    form.elements.copy_existing.checked = true;
+    $("#memorySettingsSummary").textContent = `${settings.count} 条记录 · 默认位置：${settings.default_path}`;
+    $("#memorySettingsDialog").showModal();
+    requestAnimationFrame(() => form.elements.path.focus());
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function saveMemorySettings(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const path = form.elements.path.value.trim();
+  if (!path) {
+    toast("请输入知识库存储目录", "error");
+    return;
+  }
+  try {
+    const settings = await api("/api/v1/memory-settings", {
+      method: "PUT",
+      body: JSON.stringify({ path, copy_existing: form.elements.copy_existing.checked }),
+    });
+    state.memorySettings = settings;
+    state.memoryLoaded = false;
+    state.memorySelected = "";
+    state.memoryMode = "view";
+    $("#memorySettingsDialog").close();
+    toast(`知识库已切换到 ${settings.path}`);
+    await loadMemories($("#memorySearch").value);
+  } catch (error) { toast(error.message, "error"); }
+}
+
+// The knowledge base is presented as one logical stream. Search returns only
+// hit anchors; the reader fetches a small window around the chosen anchor and
+// extends that window while scrolling.
+async function loadMemories(query = $("#memorySearch")?.value || "") {
+  const loadID = ++state.memoryLoadID;
+  query = query.trim();
+  if (!query) {
+    state.memories = [];
+    state.memorySelected = "";
+    state.memoryBlocks = [];
+    state.memoryAnchor = "";
+    state.memoryHasBefore = false;
+    state.memoryHasAfter = false;
+    state.memoryLoaded = true;
+    state.memoryLoading = false;
+    renderMemoryPanel();
+    return;
+  }
+  state.memoryLoading = true;
+  renderMemoryPanel();
+  try {
+    const params = new URLSearchParams({ q: query, limit: "100" });
+    const items = await api(`/api/v1/memories?${params}`);
+    if (loadID !== state.memoryLoadID) return;
+    state.memories = items;
+    state.memoryLoaded = true;
+    if (!items.some((item) => item.hit_id === state.memorySelected)) {
+      state.memorySelected = "";
+      state.memoryBlocks = [];
+      state.memoryAnchor = "";
+      state.memoryHasBefore = false;
+      state.memoryHasAfter = false;
+    }
+  } catch (error) {
+    if (loadID === state.memoryLoadID) toast(error.message, "error");
+  } finally {
+    if (loadID === state.memoryLoadID) {
+      state.memoryLoading = false;
+      renderMemoryPanel();
+    }
+  }
+}
+
+function selectedMemory() { return state.memories.find((item) => item.hit_id === state.memorySelected); }
+
+async function selectMemory(item) {
+  state.memorySelected = item.hit_id;
+  state.memoryMode = "view";
+  renderMemoryResults();
+  await loadMemoryAnchor(item.block_id);
+}
+
+function moveMemorySelection(direction) {
+  if (!state.memories.length) return;
+  let index = state.memories.findIndex((item) => item.hit_id === state.memorySelected);
+  if (index < 0) index = direction > 0 ? 0 : state.memories.length - 1;
+  else index = Math.max(0, Math.min(state.memories.length - 1, index + direction));
+  selectMemory(state.memories[index]);
+  requestAnimationFrame(() => $(`.memory-result[data-memory-hit="${CSS.escape(state.memories[index].hit_id)}"]`)?.scrollIntoView({ block: "nearest" }));
+}
+
+function renderMemoryResults() {
+  const root = $("#memoryResults");
+  root.replaceChildren();
+  const query = $("#memorySearch").value.trim();
+  if (state.memoryLoading) {
+    root.innerHTML = '<div class="memory-empty"><span class="loading-spinner"></span><strong>正在搜索知识内容…</strong></div>';
+    return;
+  }
+  if (!query) {
+    root.innerHTML = '<div class="memory-empty"><strong>输入关键词开始搜索</strong><span>左侧只显示实际命中的内容片段</span></div>';
+    return;
+  }
+  if (!state.memories.length) {
+    const empty = document.createElement("div");
+    empty.className = "memory-empty";
+    const title = document.createElement("strong");
+    title.textContent = "没有找到相关内容";
+    const hint = document.createElement("span");
+    hint.textContent = "换一个记得的词、命令片段、IP 或错误信息";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "记下当前内容";
+    button.addEventListener("click", () => openMemoryEditor("new", query));
+    empty.append(title, hint, button);
+    root.append(empty);
+    return;
+  }
+  for (const item of state.memories) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `memory-result${item.hit_id === state.memorySelected ? " selected" : ""}`;
+    button.dataset.memoryHit = item.hit_id;
+    button.setAttribute("role", "option");
+    button.setAttribute("aria-selected", String(item.hit_id === state.memorySelected));
+    const snippet = document.createElement("div");
+    snippet.className = "memory-result-snippet";
+    appendHighlightedText(snippet, maskSensitiveContent(item.snippet).text, query);
+    const meta = document.createElement("div");
+    meta.className = "memory-result-meta";
+    meta.textContent = [memoryMatchLabel(item.match), memorySourceLabel(item)].filter(Boolean).join(" · ");
+    button.append(snippet, meta);
+    button.addEventListener("click", () => selectMemory(item));
+    root.append(button);
+  }
+}
+
+function renderMemoryDetail() {
+  hideMemorySelectionCopy();
+  if (state.memoryMode !== "view") {
+    renderMemoryEditor();
+    return;
+  }
+  const detail = $("#memoryDetail");
+  if (state.memoryContextLoading) {
+    detail.innerHTML = '<div class="memory-detail-empty"><span class="loading-spinner"></span><span>正在定位知识内容…</span></div>';
+    return;
+  }
+  if (!state.memoryBlocks.length) {
+    detail.innerHTML = '<div class="memory-detail-empty">搜索并选择左侧片段，右侧将在统一知识流中定位</div>';
+    return;
+  }
+  const stream = document.createElement("div");
+  stream.className = "memory-stream";
+  const query = $("#memorySearch").value;
+  if (state.memoryHasBefore) {
+    const edge = document.createElement("div");
+    edge.className = "memory-stream-edge";
+    edge.textContent = state.memoryLoadingBefore ? "正在加载更早内容…" : "向上滚动加载更早内容";
+    stream.append(edge);
+  }
+  state.memoryBlocks.forEach((block, index) => {
+    if (block.document_start || index === 0) {
+      const source = document.createElement("div");
+      source.className = "memory-source-marker";
+      const label = document.createElement("span");
+      label.textContent = `${memorySourceLabel(block)} · ${formatTime(block.created_at)}`;
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.innerHTML = '<svg class="memory-action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m4 20 4.2-1 10.6-10.6-3.2-3.2L5 15.8 4 20Zm10.4-13.6 3.2 3.2M14.8 6l2-2a1.4 1.4 0 0 1 2 0l1.2 1.2a1.4 1.4 0 0 1 0 2l-2 2"/></svg><span>编辑</span>';
+      edit.addEventListener("click", () => editMemoryBlock(block));
+      source.append(label, edit);
+      stream.append(source);
+    }
+    const row = document.createElement("div");
+    row.className = `memory-content-line${block.id === state.memoryAnchor ? " memory-context-hit" : ""}`;
+    row.dataset.memoryBlock = block.id;
+    const text = maskSensitiveContent(block.text).text;
+    if (text) appendHighlightedText(row, text, query);
+    else row.append(document.createElement("br"));
+    stream.append(row);
+  });
+  if (state.memoryHasAfter) {
+    const edge = document.createElement("div");
+    edge.className = "memory-stream-edge";
+    edge.textContent = state.memoryLoadingAfter ? "正在加载后续内容…" : "向下滚动加载后续内容";
+    stream.append(edge);
+  }
+  detail.replaceChildren(stream);
+}
+
+function renderMemoryPanel() {
+  if (state.taskFilter !== "memories") return;
+  $("#memoryClearSearch").hidden = !$("#memorySearch").value;
+  renderMemoryResults();
+  renderMemoryDetail();
+  const query = $("#memorySearch").value.trim();
+  $("#taskSummary").textContent = state.memoryLoading ? "正在搜索…" : state.memories.length ? `${state.memories.length} 个命中片段` : query ? "没有命中" : "输入关键词搜索";
+}
+
+async function loadMemoryAnchor(blockID) {
+  const loadID = ++state.memoryContextLoadID;
+  state.memoryContextLoading = true;
+  state.memoryAnchor = blockID;
+  renderMemoryDetail();
+  try {
+    const page = await api(`/api/v1/memory-stream?anchor=${encodeURIComponent(blockID)}&limit=80`);
+    if (loadID !== state.memoryContextLoadID) return;
+    state.memoryBlocks = page.blocks || [];
+    state.memoryHasBefore = Boolean(page.has_before);
+    state.memoryHasAfter = Boolean(page.has_after);
+  } catch (error) {
+    if (loadID === state.memoryContextLoadID) toast(error.message, "error");
+  } finally {
+    if (loadID === state.memoryContextLoadID) {
+      state.memoryContextLoading = false;
+      renderMemoryDetail();
+      requestAnimationFrame(() => $(`[data-memory-block="${CSS.escape(blockID)}"]`, $("#memoryDetail"))?.scrollIntoView({ block: "center" }));
+    }
+  }
+}
+
+async function loadMemoryStreamEdge(direction) {
+  if (state.memoryContextLoading || !state.memoryBlocks.length) return;
+  const before = direction === "before";
+  if (before ? (!state.memoryHasBefore || state.memoryLoadingBefore) : (!state.memoryHasAfter || state.memoryLoadingAfter)) return;
+  const detail = $("#memoryDetail");
+  const cursor = before ? state.memoryBlocks[0].id : state.memoryBlocks[state.memoryBlocks.length - 1].id;
+  if (before) state.memoryLoadingBefore = true;
+  else state.memoryLoadingAfter = true;
+  const previousHeight = detail.scrollHeight;
+  const previousTop = detail.scrollTop;
+  try {
+    const page = await api(`/api/v1/memory-stream?${before ? "before" : "after"}=${encodeURIComponent(cursor)}&limit=60`);
+    const existing = new Set(state.memoryBlocks.map((block) => block.id));
+    const additions = (page.blocks || []).filter((block) => !existing.has(block.id));
+    state.memoryBlocks = before ? [...additions, ...state.memoryBlocks] : [...state.memoryBlocks, ...additions];
+    if (before) state.memoryHasBefore = Boolean(page.has_before);
+    else state.memoryHasAfter = Boolean(page.has_after);
+  } catch (error) { toast(error.message, "error"); }
+  finally {
+    if (before) state.memoryLoadingBefore = false;
+    else state.memoryLoadingAfter = false;
+    renderMemoryDetail();
+    if (before) requestAnimationFrame(() => { detail.scrollTop = previousTop + detail.scrollHeight - previousHeight; });
+  }
+}
+
 function renderTaskList() {
   $$(".task-tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.taskFilter === state.taskFilter));
   const list = $("#taskList");
+	const memoryPanel = $("#memoryPanel");
 	const clearButton = $("#clearTaskHistory");
+	const showingMemories = state.taskFilter === "memories";
+	list.hidden = showingMemories;
+	memoryPanel.hidden = !showingMemories;
+	if (showingMemories) {
+		clearButton.hidden = true;
+		renderMemoryPanel();
+		return;
+	}
 	clearButton.hidden = !["success", "failed", "logs"].includes(state.taskFilter);
 	clearButton.textContent = state.taskFilter === "logs" ? "清空日志" : "清空";
 	if (state.taskFilter === "logs") {
@@ -3039,8 +3596,83 @@ $("#editorDialog").addEventListener("cancel", (event) => {
   else requestCloseEditor();
 });
 $("#syntaxMode").addEventListener("change", refreshEditorHighlight);
-$("#queueToggle").addEventListener("click", () => $("#transferQueue").classList.toggle("collapsed"));
-$$('.task-tab').forEach((tab) => tab.addEventListener("click", () => { state.taskFilter = tab.dataset.taskFilter; $("#transferQueue").classList.remove("collapsed"); renderTaskList(); }));
+$("#queueToggle").addEventListener("click", () => {
+  if ($("#transferQueue").classList.contains("memory-fullscreen")) toggleMemoryFullscreen(false);
+  else $("#transferQueue").classList.toggle("collapsed");
+});
+$$('.task-tab').forEach((tab) => tab.addEventListener("click", () => {
+  if (tab.dataset.taskFilter === "memories") {
+    activateMemories();
+    return;
+  }
+  toggleMemoryFullscreen(false);
+  state.taskFilter = tab.dataset.taskFilter;
+  $("#transferQueue").classList.remove("collapsed");
+  renderTaskList();
+}));
+$("#memorySearch").addEventListener("input", (event) => {
+  const query = event.currentTarget.value;
+  state.memoryMode = "view";
+  state.memories = [];
+  state.memorySelected = "";
+  state.memoryBlocks = [];
+  state.memoryAnchor = "";
+  state.memoryHasBefore = false;
+  state.memoryHasAfter = false;
+  state.memoryLoading = Boolean(query.trim());
+  $("#memoryClearSearch").hidden = !query;
+  renderMemoryPanel();
+  clearTimeout(memorySearchTimer);
+  memorySearchTimer = setTimeout(() => loadMemories(query), 180);
+});
+$("#memorySearch").addEventListener("keydown", (event) => {
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    moveMemorySelection(event.key === "ArrowDown" ? 1 : -1);
+  } else if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    openMemoryEditor("new", event.currentTarget.value);
+  } else if (event.key === "Enter" && selectedMemory()) {
+    event.preventDefault();
+    $("#memoryDetail").focus();
+  }
+});
+$("#memoryClearSearch").addEventListener("click", () => {
+  $("#memorySearch").value = "";
+  $("#memoryClearSearch").hidden = true;
+  loadMemories();
+  $("#memorySearch").focus();
+});
+$("#memoryNew").addEventListener("click", () => openMemoryEditor("new"));
+$("#memoryImport").addEventListener("click", () => $("#memoryImportFiles").click());
+$("#memoryLocation").addEventListener("click", openMemorySettings);
+$("#memoryImportFiles").addEventListener("change", async (event) => {
+  await importMemoryFiles(event.currentTarget.files);
+  event.currentTarget.value = "";
+});
+$("#memoryFullscreen").addEventListener("click", () => toggleMemoryFullscreen());
+$("#memoryDetail").addEventListener("scroll", (event) => {
+  hideMemorySelectionCopy();
+  if (state.taskFilter !== "memories" || state.memoryMode !== "view") return;
+  const node = event.currentTarget;
+  if (node.scrollTop < 120) loadMemoryStreamEdge("before");
+  if (node.scrollHeight - node.scrollTop - node.clientHeight < 160) loadMemoryStreamEdge("after");
+});
+$("#memoryDetail").addEventListener("mousedown", hideMemorySelectionCopy);
+$("#memoryDetail").addEventListener("mouseup", () => requestAnimationFrame(updateMemorySelectionCopy));
+$("#memoryDetail").addEventListener("keyup", () => requestAnimationFrame(updateMemorySelectionCopy));
+$("#memorySelectionCopy").addEventListener("mousedown", (event) => event.preventDefault());
+$("#memorySelectionCopy").addEventListener("click", async () => {
+  if (!state.memorySelectionText) return;
+  await copyText(state.memorySelectionText, "选中文字已复制");
+  hideMemorySelectionCopy();
+});
+$("#memorySettingsForm").addEventListener("submit", saveMemorySettings);
+$("#memoryUseDefault").addEventListener("click", () => {
+  if (state.memorySettings) $("#memorySettingsForm").elements.path.value = state.memorySettings.default_path;
+});
+$("#memorySettingsCancel").addEventListener("click", () => $("#memorySettingsDialog").close());
+$("#memorySettingsClose").addEventListener("click", () => $("#memorySettingsDialog").close());
 $("#clearTaskHistory").addEventListener("click", clearTaskHistory);
 $("#imagePreview").addEventListener("load", fitImage);
 $("#previousImage").addEventListener("click", () => changeImage(-1));
@@ -3076,6 +3708,16 @@ document.addEventListener("mousedown", (event) => {
   if (!event.target.closest("#terminalMenu, .terminal-button")) hideTerminalMenu();
 });
 document.addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    activateMemories();
+    return;
+  }
+  if (event.key === "Escape" && $("#transferQueue").classList.contains("memory-fullscreen")) {
+    event.preventDefault();
+    toggleMemoryFullscreen(false);
+    return;
+  }
   if ($("#imageDialog").open) {
     if (event.key === "ArrowLeft") changeImage(-1);
     if (event.key === "ArrowRight") changeImage(1);

@@ -22,6 +22,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,9 @@ type Server struct {
 	manager         *core.Manager
 	sessionStore    *sessionStore
 	bookmarks       *bookmarkStore
+	preferences     *Preferences
+	memoryMu        sync.RWMutex
+	memories        *memoryStore
 	templates       *transferTemplateStore
 	transfers       *core.TransferEngine
 	connectProvider func(core.ConnectRequest) (core.ProviderInfo, error)
@@ -52,8 +56,20 @@ type Server struct {
 }
 
 func New(dataDir string) (*Server, error) {
+	preferences, _ := LoadPreferences(dataDir)
+	return NewWithPreferences(dataDir, preferences)
+}
+
+func NewWithPreferences(dataDir string, preferences *Preferences) (*Server, error) {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, err
+	}
+	if preferences == nil {
+		var err error
+		preferences, err = LoadPreferences(dataDir)
+		if err != nil {
+			return nil, err
+		}
 	}
 	manager := core.NewManager()
 	if err := createBaseProvider(manager, dataDir); err != nil {
@@ -67,6 +83,17 @@ func New(dataDir string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	memoryDir, err := resolveKnowledgeBaseDir(dataDir, preferences.KnowledgeBaseDir())
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(memoryDir, 0o700); err != nil {
+		return nil, err
+	}
+	memories, err := newMemoryStore(memoryDir)
+	if err != nil {
+		return nil, err
+	}
 	templates, err := newTransferTemplateStore(dataDir)
 	if err != nil {
 		return nil, err
@@ -74,6 +101,8 @@ func New(dataDir string) (*Server, error) {
 	server := &Server{
 		dataDir: dataDir, manager: manager, sessionStore: sessionStore,
 		bookmarks:       bookmarks,
+		preferences:     preferences,
+		memories:        memories,
 		templates:       templates,
 		transfers:       core.NewTransferEngine(manager, filepath.Join(dataDir, "tasks.json")),
 		connectProvider: manager.Connect,
@@ -83,6 +112,17 @@ func New(dataDir string) (*Server, error) {
 	}
 	server.activity.Add("info", "system", "Floe Core 已启动", "")
 	return server, nil
+}
+
+func resolveKnowledgeBaseDir(dataDir, configured string) (string, error) {
+	configured = strings.TrimSpace(configured)
+	if configured == "" {
+		return filepath.Clean(dataDir), nil
+	}
+	if !filepath.IsAbs(configured) {
+		return "", errors.New("知识库存储位置必须是绝对路径")
+	}
+	return filepath.Clean(configured), nil
 }
 
 func createBaseProvider(manager *core.Manager, dataDir string) error {
@@ -237,6 +277,24 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.bookmarks.List())
 	case r.Method == http.MethodPut && r.URL.Path == "/api/v1/bookmarks":
 		s.saveBookmarks(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/memory-settings":
+		s.memorySettings(w)
+	case r.Method == http.MethodPut && r.URL.Path == "/api/v1/memory-settings":
+		s.saveMemorySettings(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/memory-stream":
+		s.memoryStream(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/memories":
+		s.listMemories(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/memories":
+		s.saveMemory(w, r, "")
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v1/memories/") && strings.HasSuffix(r.URL.Path, "/used"):
+		s.markMemoryUsed(w, r)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/memories/"):
+		s.memoryDetails(w, r)
+	case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/api/v1/memories/"):
+		s.saveMemory(w, r, strings.TrimPrefix(r.URL.Path, "/api/v1/memories/"))
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/v1/memories/"):
+		s.deleteMemory(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions":
 		s.saveSession(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/private-key":
@@ -329,6 +387,224 @@ func (s *Server) saveBookmarks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
+	limit := 80
+	if value := strings.TrimSpace(r.URL.Query().Get("limit")); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			limit = parsed
+		}
+	}
+	items, err := s.memoryStore().List(r.URL.Query().Get("q"), limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "MEMORY_LIST_FAILED", "无法读取速查记录", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) memoryStream(w http.ResponseWriter, r *http.Request) {
+	limit := 60
+	if value := strings.TrimSpace(r.URL.Query().Get("limit")); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			limit = parsed
+		}
+	}
+	page, err := s.memoryStore().Stream(
+		strings.TrimSpace(r.URL.Query().Get("anchor")),
+		strings.TrimSpace(r.URL.Query().Get("before")),
+		strings.TrimSpace(r.URL.Query().Get("after")),
+		limit,
+	)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "MEMORY_BLOCK_NOT_FOUND", "知识内容位置不存在", "")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "MEMORY_STREAM_FAILED", "无法读取知识上下文", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) memoryDetails(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/v1/memories/")
+	if id == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusNotFound, "MEMORY_NOT_FOUND", "速查内容不存在", "")
+		return
+	}
+	item, err := s.memoryStore().Get(id)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "MEMORY_NOT_FOUND", "速查内容不存在", "")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "MEMORY_READ_FAILED", "无法读取速查内容", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (s *Server) saveMemory(w http.ResponseWriter, r *http.Request, id string) {
+	if strings.Contains(id, "/") {
+		writeError(w, http.StatusNotFound, "MEMORY_NOT_FOUND", "速查记录不存在", "")
+		return
+	}
+	var request struct {
+		Content    string `json:"content"`
+		Source     string `json:"source"`
+		SourcePath string `json:"source_path"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	item, err := s.memoryStore().Save(id, request.Content, request.Source, request.SourcePath)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "MEMORY_SAVE_FAILED", "保存速查记录失败", err.Error())
+		return
+	}
+	status := http.StatusOK
+	if id == "" {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, item)
+}
+
+func (s *Server) deleteMemory(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/v1/memories/")
+	if id == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusNotFound, "MEMORY_NOT_FOUND", "速查记录不存在", "")
+		return
+	}
+	if err := s.memoryStore().Delete(id); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "MEMORY_NOT_FOUND", "速查记录不存在", "")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "MEMORY_DELETE_FAILED", "删除速查记录失败", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) markMemoryUsed(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/memories/"), "/used")
+	if id == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusNotFound, "MEMORY_NOT_FOUND", "速查记录不存在", "")
+		return
+	}
+	if err := s.memoryStore().MarkUsed(id); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "MEMORY_NOT_FOUND", "速查记录不存在", "")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "MEMORY_UPDATE_FAILED", "无法更新速查记录", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) memoryStore() *memoryStore {
+	s.memoryMu.RLock()
+	defer s.memoryMu.RUnlock()
+	return s.memories
+}
+
+func (s *Server) memorySettings(w http.ResponseWriter) {
+	store := s.memoryStore()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path": store.Directory(), "default_path": filepath.Clean(s.dataDir),
+		"custom": !samePath(store.Directory(), s.dataDir), "count": store.Count(),
+	})
+}
+
+func (s *Server) saveMemorySettings(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Path         string `json:"path"`
+		CopyExisting bool   `json:"copy_existing"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	target, err := resolveKnowledgeBaseDir(s.dataDir, request.Path)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "MEMORY_PATH_INVALID", "知识库存储位置无效", err.Error())
+		return
+	}
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		writeError(w, http.StatusBadRequest, "MEMORY_PATH_INVALID", "无法创建知识库目录", err.Error())
+		return
+	}
+	current := s.memoryStore()
+	if samePath(current.Directory(), target) {
+		s.memorySettings(w)
+		return
+	}
+	if request.CopyExisting {
+		if err := copyMemoryStoreFiles(current, target); err != nil {
+			writeError(w, http.StatusConflict, "MEMORY_COPY_FAILED", "复制现有知识库失败", err.Error())
+			return
+		}
+	}
+	next, err := newMemoryStore(target)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "MEMORY_PATH_INVALID", "无法打开目标知识库", err.Error())
+		return
+	}
+	storedPath := target
+	if samePath(target, s.dataDir) {
+		storedPath = ""
+	}
+	if err := s.preferences.SetKnowledgeBaseDir(storedPath); err != nil {
+		writeError(w, http.StatusInternalServerError, "MEMORY_SETTINGS_SAVE_FAILED", "无法保存知识库位置", err.Error())
+		return
+	}
+	s.memoryMu.Lock()
+	s.memories = next
+	s.memoryMu.Unlock()
+	s.memorySettings(w)
+}
+
+func samePath(left, right string) bool {
+	left = filepath.Clean(left)
+	right = filepath.Clean(right)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
+func copyMemoryStoreFiles(source *memoryStore, targetDir string) error {
+	targetKey := filepath.Join(targetDir, "memory.key")
+	targetData := filepath.Join(targetDir, "memories.json")
+	for _, target := range []string{targetKey, targetData} {
+		if _, err := os.Stat(target); err == nil {
+			return errors.New("目标目录已经包含知识库；取消“复制现有记录”可直接切换")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	key, err := os.ReadFile(source.keyPath)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(source.path)
+	if errors.Is(err, os.ErrNotExist) {
+		data = nil
+	} else if err != nil {
+		return err
+	}
+	if err := os.WriteFile(targetKey, key, 0o600); err != nil {
+		return err
+	}
+	if data != nil {
+		if err := os.WriteFile(targetData, data, 0o600); err != nil {
+			_ = os.Remove(targetKey)
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Server) addClientLog(w http.ResponseWriter, r *http.Request) {

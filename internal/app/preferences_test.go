@@ -18,12 +18,19 @@ func TestPreferencesDefaultAndPersistence(t *testing.T) {
 	if err := preferences.SetOpenBrowserOnStartup(false); err != nil {
 		t.Fatal(err)
 	}
+	knowledgeBaseDir := filepath.Join(dataDir, "knowledge")
+	if err := preferences.SetKnowledgeBaseDir(knowledgeBaseDir); err != nil {
+		t.Fatal(err)
+	}
 	reloaded, err := LoadPreferences(dataDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if reloaded.OpenBrowserOnStartup() {
 		t.Fatal("open browser on startup was not persisted as false")
+	}
+	if reloaded.KnowledgeBaseDir() != knowledgeBaseDir {
+		t.Fatalf("knowledge base directory = %q", reloaded.KnowledgeBaseDir())
 	}
 }
 

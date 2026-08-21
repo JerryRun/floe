@@ -41,7 +41,7 @@ func main() {
 	}
 	defer release()
 
-	server, err := app.New(*dataDir)
+	server, err := app.NewWithPreferences(*dataDir, preferences)
 	if err != nil {
 		fail("Floe Core 初始化失败", err)
 		return

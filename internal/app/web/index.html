@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light">
   <title>Floe</title>
   <link rel="icon" type="image/png" href="/assets/floe-64.png?v=3">
-  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/styles.css?v=13">
 </head>
 <body>
   <div class="app-shell">
@@ -75,12 +75,27 @@
             <button class="task-tab" data-task-filter="success">成功 <span id="successCount">0</span></button>
             <button class="task-tab" data-task-filter="failed">失败 <span id="failedCount">0</span></button>
             <button class="task-tab" data-task-filter="logs">日志 <span id="logCount">0</span></button>
+            <button class="task-tab memory-tab" data-task-filter="memories">速查</button>
           </div>
           <span id="taskSummary">暂无任务</span>
           <button id="clearTaskHistory" hidden>清空</button>
           <button id="queueToggle" title="收起任务区域" aria-label="收起任务区域"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button>
         </div>
         <div class="task-list" id="taskList"><div class="empty-row">拖动文件到另一侧开始传输</div></div>
+        <section class="memory-panel" id="memoryPanel" hidden>
+          <div class="memory-toolbar">
+            <label class="memory-search"><span class="material-symbols-rounded" aria-hidden="true">search</span><input id="memorySearch" autocomplete="off" placeholder='搜索文字或命令，使用 "..." 精确匹配'><button type="button" id="memoryClearSearch" title="清空搜索" aria-label="清空搜索" hidden><span class="material-symbols-rounded" aria-hidden="true">close</span></button></label>
+            <button type="button" id="memoryNew"><span class="material-symbols-rounded" aria-hidden="true">add</span><span>随手记</span></button>
+            <button type="button" id="memoryImport"><span class="material-symbols-rounded" aria-hidden="true">upload</span><span>导入</span></button>
+            <button type="button" id="memoryLocation"><span class="material-symbols-rounded" aria-hidden="true">folder</span><span>位置</span></button>
+            <button type="button" id="memoryFullscreen" title="展开速查" aria-label="展开速查"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button>
+            <input id="memoryImportFiles" type="file" accept=".txt,.md,.markdown,text/plain,text/markdown" multiple hidden>
+          </div>
+          <div class="memory-workspace">
+            <div class="memory-results" id="memoryResults" role="listbox" aria-label="速查结果"></div>
+            <div class="memory-detail" id="memoryDetail" tabindex="0"></div>
+          </div>
+        </section>
       </section>
     </main>
   </div>
@@ -118,6 +133,18 @@
         <input type="hidden" name="fingerprint">
       </div>
       <div class="dialog-actions"><button type="button" class="dialog-cancel">取消</button><button type="submit" value="save">保存</button><button type="submit" class="primary" value="connect">保存并连接</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="memorySettingsDialog" class="dialog memory-settings-dialog">
+    <form id="memorySettingsForm">
+      <div class="dialog-title"><h2>知识库存储位置</h2><button type="button" id="memorySettingsClose" aria-label="关闭"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></div>
+      <div class="form-grid">
+        <label class="wide">存储目录<input name="path" class="memory-path-input" required spellcheck="false"><small id="memorySettingsSummary">知识库内容和加密密钥将保存在此目录</small></label>
+        <label class="wide keepalive-toggle"><input name="copy_existing" type="checkbox" checked><span>将当前知识库复制到新位置</span></label>
+        <div class="wide memory-settings-note">如果目标目录已经包含知识库，请取消复制选项以直接切换。原目录不会自动删除，可作为备份保留。</div>
+      </div>
+      <div class="dialog-actions"><button type="button" id="memoryUseDefault">恢复默认位置</button><button type="button" id="memorySettingsCancel">取消</button><button type="submit" class="primary">保存并切换</button></div>
     </form>
   </dialog>
 
@@ -240,6 +267,7 @@
   </dialog>
 
   <div class="toast-stack" id="toastStack" aria-live="polite"></div>
+  <button type="button" class="memory-selection-copy" id="memorySelectionCopy" hidden><svg class="memory-action-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="12" rx="1.5"/><path d="M16 8V5.5A1.5 1.5 0 0 0 14.5 4h-9A1.5 1.5 0 0 0 4 5.5v10A1.5 1.5 0 0 0 5.5 17H8"/></svg><span>复制</span></button>
   <div class="context-menu" id="contextMenu" role="menu"></div>
   <div class="local-tree-popup" id="localTreePopup"></div>
   <div class="bookmark-menu" id="bookmarkMenu" role="menu"></div>
@@ -255,6 +283,6 @@
   <script src="/assets/hls.min.js" defer></script>
   <script src="/assets/vendor/marked.min.js" defer></script>
   <script src="/assets/vendor/purify.min.js" defer></script>
-  <script src="/app.js" defer></script>
+  <script src="/app.js?v=12" defer></script>
 </body>
 </html>
