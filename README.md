@@ -6,7 +6,7 @@
 
 <p align="center">
   Windows 上的多服务器文件工作台。<br>
-  在一个窗口中管理本地与远程文件，从服务器 A 向服务器 B 传输文件，编辑和预览远程内容，并随时打开 SSH Terminal。
+  在一个窗口中管理本地与远程文件，从服务器 A 向服务器 B 传输文件，编辑和预览远程内容，打开 SSH Terminal，并用 Ctrl+K 随时查找服务器命令与操作说明。
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@
   Windows x64 · Portable · No installation required · Open source
 </p>
 
-Floe 面向在 Windows 上管理 Linux 服务器、支持 SFTP/FTP 的 NAS 和远程文件的开发者与运维人员。左右两侧可以分别打开本地目录或不同服务器，在同一个工作流中完成浏览、传输、校验、编辑、预览和 SSH 操作，不必反复切换文件管理器、终端和编辑器。
+Floe 面向在 Windows 上管理 Linux 服务器、支持 SFTP/FTP 的 NAS 和远程文件的开发者与运维人员。左右两侧可以分别打开本地目录或不同服务器，在同一个工作流中完成浏览、传输、校验、编辑、预览和 SSH 操作，并把常用命令、地址、账号说明和故障处理步骤保存在随时可搜索的速查知识库中。
 
 ![使用 Floe 在 Build Server 和 Production Server 之间传输并校验文件](docs/demo/floe-server-to-server.gif)
 
@@ -40,6 +40,10 @@ Floe 面向在 Windows 上管理 Linux 服务器、支持 SFTP/FTP 的 NAS 和�
 ### SSH + File Management
 
 从当前 SFTP 会话一键打开 Windows Terminal。可以选择新标签、右侧窗格或下方窗格，让文件操作和服务器命令保持在同一工作流中。
+
+### Ctrl+K Server Quick Reference
+
+按 `Ctrl+K` 随时搜索或记录部署命令、服务器地址、账号说明、配置文件位置和故障处理步骤。速查内容在本机加密保存，让服务器文件、SSH 操作和运维知识留在同一个工作区。
 
 ## Built for reliable transfers
 
@@ -69,6 +73,20 @@ Floe 面向在 Windows 上管理 Linux 服务器、支持 SFTP/FTP 的 NAS 和�
 目标文件已存在时，先比较来源和目标信息，再选择覆盖、跳过、仅更新时覆盖或自动重命名，也可以将选择应用到本批次后续冲突。
 
 ![Floe 文件冲突处理](docs/screenshots/floe-conflict.png)
+
+### Ctrl+K 运维速查
+
+不离开文件工作区即可查找与当前服务器相关的命令和说明。速查支持智能短语、双引号精确搜索、统一上下文、敏感字段隐藏、全文编辑，以及文本或 Markdown 文件导入。
+
+```text
+Ctrl + K
+
+nginx production
+├─ 配置文件：/etc/nginx/nginx.conf
+├─ 检查配置：nginx -t
+├─ 重新加载：systemctl reload nginx
+└─ 发布说明：先检查 upstream，再执行健康检查
+```
 
 截图使用匿名演示数据，不包含真实服务器、账号或用户文件。
 
@@ -106,6 +124,10 @@ Server  ↔ NAS
 
 选择文件或目录并拖动到另一侧，或使用面板工具栏中的上传/下载按钮。Floe 会创建传输任务，并显示读取、写入和校验进度。
 
+### 6. 记录常用命令和说明
+
+按 `Ctrl+K` 打开速查，记录服务器命令、地址、账号说明、配置位置或操作步骤。以后无需离开 Floe，即可通过关键词或双引号精确搜索快速找回。
+
 ## What you can do
 
 ### 管理多台服务器
@@ -139,11 +161,12 @@ Server  ↔ NAS
 - 密码不会出现在 PowerShell 命令或进程参数中。
 - Core 确认主机指纹后，Windows OpenSSH 使用 `accept-new` 记录首次出现的主机密钥。
 
-### 保存服务器知识
+### Ctrl+K 速查服务器知识
 
 - 使用 `Ctrl+K` 搜索或记录命令、地址、账号和操作说明。
-- 支持智能短语、双引号精确搜索、上下文查看、敏感字段隐藏和全文编辑。
-- 导入文本或 Markdown 文件，并将加密知识库移动到自定义目录。
+- 支持智能短语、双引号精确搜索、按命中位置加载统一上下文、敏感字段隐藏和全文编辑。
+- 支持选中文字快速复制、长内容全屏阅读，以及文本或 Markdown 文件导入。
+- 速查内容使用独立 AES-GCM 密钥加密保存，并可将知识库移动到自定义目录。
 
 ### 使用命令行
 
