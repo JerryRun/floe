@@ -12,8 +12,19 @@ type Entry struct {
 	Size     int64     `json:"size"`
 	Mode     string    `json:"mode"`
 	Modified time.Time `json:"modified"`
-	IsDir    bool      `json:"is_dir"`
-	IsLink   bool      `json:"is_link"`
+	// IsDir reports whether the entry can be used as a directory. For symlinks
+	// it describes the link target, so browsing, sorting and icons all treat a
+	// link to a directory the same way they treat a real one.
+	IsDir  bool `json:"is_dir"`
+	IsLink bool `json:"is_link"`
+	// LinkTarget is the raw text the symlink points at, shown as a hint.
+	LinkTarget string `json:"link_target,omitempty"`
+	// LinkBroken marks a symlink whose target could not be stat'ed.
+	LinkBroken bool `json:"link_broken,omitempty"`
+	// LinkUnresolved marks a symlink whose target type is still unknown, either
+	// because the listing exhausted its resolve budget or because the provider
+	// resolves links on demand. IsDir is not meaningful until it is resolved.
+	LinkUnresolved bool `json:"link_unresolved,omitempty"`
 }
 
 type FileInfo struct {
@@ -64,6 +75,12 @@ type WriteSlotController interface {
 // The transfer engine falls back to ReadAt verification when unavailable.
 type RangeSHA256Verifier interface {
 	SHA256Range(path string, offset, length int64) ([]byte, error)
+}
+
+// LinkResolver reports what a symlink points at. Providers implement it so the
+// browser can fill in entries a listing left unresolved without guessing.
+type LinkResolver interface {
+	ResolveLink(path string) (target string, info FileInfo, err error)
 }
 
 // AtomicReplacer promotes a fully written temporary file over its destination

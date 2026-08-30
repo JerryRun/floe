@@ -41,6 +41,7 @@ type Server struct {
 	preferences     *Preferences
 	memoryMu        sync.RWMutex
 	memories        *memoryStore
+	retiredMemories []*memoryStore
 	templates       *transferTemplateStore
 	transfers       *core.TransferEngine
 	connectProvider func(core.ConnectRequest) (core.ProviderInfo, error)
@@ -194,11 +195,21 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.monitorCancel != nil {
 		s.monitorCancel()
 	}
-	_ = s.manager.Close()
-	if s.httpServer == nil {
-		return nil
+	var shutdownErr error
+	if s.httpServer != nil {
+		shutdownErr = s.httpServer.Shutdown(ctx)
 	}
-	return s.httpServer.Shutdown(ctx)
+	_ = s.manager.Close()
+	s.memoryMu.Lock()
+	stores := append([]*memoryStore{s.memories}, s.retiredMemories...)
+	s.retiredMemories = nil
+	s.memoryMu.Unlock()
+	for _, store := range stores {
+		if store != nil {
+			_ = store.Close()
+		}
+	}
+	return shutdownErr
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -281,6 +292,12 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		s.memorySettings(w)
 	case r.Method == http.MethodPut && r.URL.Path == "/api/v1/memory-settings":
 		s.saveMemorySettings(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/memory-search-history":
+		s.listMemorySearchHistory(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/memory-search-history":
+		s.recordMemorySearchHistory(w, r)
+	case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/memory-search-history":
+		s.deleteMemorySearchHistory(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/memory-stream":
 		s.memoryStream(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/memories":
@@ -327,6 +344,8 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		s.deleteHTMLPreview(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/v1/files/html-resource/") && r.Method == http.MethodGet:
 		s.serveHTMLPreviewResource(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/files/resolve-links":
+		s.resolveLinks(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/files/mkdir":
 		s.mkdir(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/files/create":
@@ -402,6 +421,43 @@ func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) listMemorySearchHistory(w http.ResponseWriter, r *http.Request) {
+	items, err := s.memoryStore().ListSearchHistory(r.URL.Query().Get("q"), maxMemorySearchHistory)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "MEMORY_SEARCH_HISTORY_LIST_FAILED", "无法读取搜索历史", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) recordMemorySearchHistory(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Query string `json:"query"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	item, err := s.memoryStore().RecordSearchHistory(request.Query)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "MEMORY_SEARCH_HISTORY_SAVE_FAILED", "保存搜索历史失败", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (s *Server) deleteMemorySearchHistory(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query().Get("query")
+	if err := s.memoryStore().DeleteSearchHistory(query); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "MEMORY_SEARCH_HISTORY_NOT_FOUND", "搜索历史不存在", "")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "MEMORY_SEARCH_HISTORY_DELETE_FAILED", "删除搜索历史失败", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) memoryStream(w http.ResponseWriter, r *http.Request) {
@@ -557,11 +613,13 @@ func (s *Server) saveMemorySettings(w http.ResponseWriter, r *http.Request) {
 		storedPath = ""
 	}
 	if err := s.preferences.SetKnowledgeBaseDir(storedPath); err != nil {
+		_ = next.Close()
 		writeError(w, http.StatusInternalServerError, "MEMORY_SETTINGS_SAVE_FAILED", "无法保存知识库位置", err.Error())
 		return
 	}
 	s.memoryMu.Lock()
 	s.memories = next
+	s.retiredMemories = append(s.retiredMemories, current)
 	s.memoryMu.Unlock()
 	s.memorySettings(w)
 }
@@ -576,35 +634,25 @@ func samePath(left, right string) bool {
 }
 
 func copyMemoryStoreFiles(source *memoryStore, targetDir string) error {
-	targetKey := filepath.Join(targetDir, "memory.key")
-	targetData := filepath.Join(targetDir, "memories.json")
-	for _, target := range []string{targetKey, targetData} {
+	targetData := filepath.Join(targetDir, "memories.db")
+	for _, target := range []string{
+		targetData,
+		filepath.Join(targetDir, "memories.json"),
+		filepath.Join(targetDir, "memory.key"),
+	} {
 		if _, err := os.Stat(target); err == nil {
 			return errors.New("目标目录已经包含知识库；取消“复制现有记录”可直接切换")
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
-	key, err := os.ReadFile(source.keyPath)
-	if err != nil {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if _, err := source.db.Exec(`VACUUM INTO ?`, targetData); err != nil {
+		_ = os.Remove(targetData)
 		return err
 	}
-	data, err := os.ReadFile(source.path)
-	if errors.Is(err, os.ErrNotExist) {
-		data = nil
-	} else if err != nil {
-		return err
-	}
-	if err := os.WriteFile(targetKey, key, 0o600); err != nil {
-		return err
-	}
-	if data != nil {
-		if err := os.WriteFile(targetData, data, 0o600); err != nil {
-			_ = os.Remove(targetKey)
-			return err
-		}
-	}
-	return nil
+	return os.Chmod(targetData, 0o600)
 }
 
 func (s *Server) addClientLog(w http.ResponseWriter, r *http.Request) {
@@ -897,6 +945,60 @@ func errorDetail(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// maxResolveLinkPaths bounds one on-demand resolve request. A listing only marks
+// entries unresolved past its own budget, so the browser never needs more.
+const maxResolveLinkPaths = 512
+
+// resolveLinks reports what each named symlink points at. Listings resolve a
+// bounded number of links inline and leave the rest to this endpoint, so a
+// directory made almost entirely of links still renders immediately.
+func (s *Server) resolveLinks(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Provider string   `json:"provider"`
+		Paths    []string `json:"paths"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	provider, ok := s.provider(w, req.Provider)
+	if !ok {
+		return
+	}
+	resolver, ok := provider.(core.LinkResolver)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "RESOLVE_UNSUPPORTED", "该连接不支持解析链接", provider.Kind())
+		return
+	}
+	if len(req.Paths) > maxResolveLinkPaths {
+		req.Paths = req.Paths[:maxResolveLinkPaths]
+	}
+	type resolved struct {
+		Path   string `json:"path"`
+		Target string `json:"link_target,omitempty"`
+		IsDir  bool   `json:"is_dir"`
+		Size   int64  `json:"size"`
+		Broken bool   `json:"link_broken,omitempty"`
+	}
+	results := make([]resolved, 0, len(req.Paths))
+	for _, remotePath := range req.Paths {
+		if remotePath == "" {
+			continue
+		}
+		target, info, err := resolver.ResolveLink(remotePath)
+		if err != nil {
+			if provider.Kind() != "local" && core.IsConnectionError(err) {
+				s.manager.Remove(provider.ID())
+				writeError(w, http.StatusBadGateway, "CONNECTION_LOST", "连接已断开，正在重新连接", err.Error())
+				return
+			}
+			results = append(results, resolved{Path: remotePath, Target: target, Broken: true})
+			continue
+		}
+		results = append(results, resolved{Path: remotePath, Target: target, IsDir: info.IsDir, Size: info.Size})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"links": results})
 }
 
 func (s *Server) mkdir(w http.ResponseWriter, r *http.Request) {

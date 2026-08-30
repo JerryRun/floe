@@ -19,6 +19,10 @@ const state = {
   taskSelection: new Set(),
   logs: [],
   taskFilter: "queue",
+  // The preview is either its own modal window (host "dialog", the default) or a
+  // tab in the bottom task area (host "panel"). Both hosts share the same file
+  // tabs and cached per-file view state.
+  preview: { host: "dialog", items: [], activeID: "", maximized: false },
   memories: [],
   memorySelected: "",
   memoryLoaded: false,
@@ -37,6 +41,10 @@ const state = {
   memoryLoadingAfter: false,
   memoryAnchor: "",
   memorySettings: null,
+  memorySearchHistory: [],
+  memorySearchHistoryLoaded: false,
+  memorySearchHistoryOpen: false,
+  memorySearchHistorySort: "frequency",
   localTreeSide: "",
   bookmarkSide: "",
   terminalProvider: "",
@@ -52,11 +60,13 @@ const state = {
 const DND_FILE = "application/x-floe-file";
 const DND_SESSION = "application/x-floe-session";
 const DND_TAB = "application/x-floe-tab";
+const MEMORY_SEARCH_HISTORY_LIMIT = 100;
 const BOOKMARKS_STORAGE = "floe.bookmarks.v1";
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 let editorPreviewTimer = 0;
 let memorySearchTimer = 0;
+let memorySearchHistoryMutation = Promise.resolve();
 
 async function api(url, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -332,7 +342,7 @@ function renderPublishSidebar() {
     remove.type = "button";
     remove.className = "icon-button danger";
     remove.setAttribute("aria-label", "删除发布任务");
-    remove.innerHTML = '<span class="material-symbols-rounded" aria-hidden="true">delete</span>';
+    remove.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M9 7V4h6v3m-8 0 1 13h6l1-13M10 11v5m4-5v5"/></svg>';
     remove.addEventListener("click", () => deletePublishTemplate(template));
     actions.append(run, edit, remove);
     row.append(name, actions);
@@ -678,6 +688,7 @@ async function loadPanel(side, allowReconnect = true) {
     updateSortHeaders(side);
     renderPanel(side);
     saveWorkspace();
+    resolvePanelLinks(side);
   } catch (error) {
     if (loadID !== panel.loadID) return;
     if (allowReconnect && error.payload?.code === "CONNECTION_LOST" && provider?.kind !== "local") {
@@ -796,10 +807,10 @@ function renderPanel(side) {
     node.style.transform = `translate(${column * width}px, ${row * cellHeight}px)`;
     node.style.width = `${list ? viewport.clientWidth : width - 6}px`;
     node.draggable = true;
-    node.title = entry.path;
+    node.title = entryTitle(entry);
     const visual = fileVisual(entry, side, panel.view);
     node.dataset.index = String(index);
-    node.innerHTML = `<span class="file-name"><i class="file-icon${visual.preview ? " image-preview" : ""}">${visual.html}</i><b class="file-label">${escapeHTML(entry.name)}</b></span><span class="file-size">${entry.is_dir ? "" : formatBytes(entry.size)}</span><span class="file-time">${formatTime(entry.modified)}</span><span class="file-mode">${escapeHTML(entry.mode)}</span>`;
+    node.innerHTML = `<span class="file-name"><i class="file-icon${visual.preview ? " image-preview" : ""}${entryIconClass(entry)}">${visual.html}</i><b class="file-label">${escapeHTML(entry.name)}</b></span><span class="file-size">${entrySizeLabel(entry)}</span><span class="file-time">${formatTime(entry.modified)}</span><span class="file-mode">${escapeHTML(entry.mode)}</span>`;
     node.addEventListener("click", (event) => selectEntry(side, index, event));
     node.addEventListener("dblclick", () => openEntry(side, index));
     node.addEventListener("dragstart", (event) => {
@@ -871,13 +882,82 @@ function selectEntry(side, index, event = {}) {
 }
 
 async function openEntry(side, index) {
-  const entry = state.panels[side].entries[index];
+  let entry = state.panels[side].entries[index];
+  if (entry.is_link && entry.link_unresolved) {
+    // A large listing deferred this link, so ask for just this one before
+    // deciding between navigating and previewing.
+    await resolvePanelLinks(side, [entry.path]);
+    entry = state.panels[side].entries[index] || entry;
+  }
+  if (entry.is_link && entry.link_broken) {
+    toast(entry.link_target ? `链接目标不存在：${entry.link_target}` : "链接目标不存在", "error");
+    return;
+  }
   if (entry.is_dir) {
     currentTab(side).path = entry.path;
     await loadPanel(side);
   } else {
     await openFile(side, entry);
   }
+}
+
+// resolvePanelLinks fills in symlinks the listing left unresolved. A directory
+// made almost entirely of links renders immediately and the real target types
+// arrive right afterwards.
+async function resolvePanelLinks(side, paths) {
+  const panel = state.panels[side];
+  const tab = currentTab(side);
+  if (!tab?.provider) return;
+  const wanted = paths || panel.entries.filter((entry) => entry.link_unresolved).map((entry) => entry.path);
+  if (!wanted.length) return;
+  const loadID = panel.loadID;
+  try {
+    const result = await api("/api/v1/files/resolve-links", {
+      method: "POST",
+      body: JSON.stringify({ provider: tab.provider, paths: wanted }),
+    });
+    if (loadID !== panel.loadID) return;
+    const resolved = new Map((result.links || []).map((link) => [link.path, link]));
+    let changed = false;
+    for (const entry of panel.entries) {
+      const link = resolved.get(entry.path);
+      if (!link) continue;
+      entry.link_unresolved = false;
+      entry.is_dir = Boolean(link.is_dir);
+      entry.link_broken = Boolean(link.link_broken);
+      if (link.link_target) entry.link_target = link.link_target;
+      if (!link.is_dir && !link.link_broken) entry.size = link.size;
+      changed = true;
+    }
+    if (!changed) return;
+    panel.entries = sortEntries(panel.entries, panel.sort);
+    renderPanel(side);
+  } catch (_) {
+    // Unresolved links keep their neutral icon; nothing else depends on this.
+  }
+}
+
+// entryIconClass marks a symlink on top of its target's icon, so a link to a
+// directory looks like a folder and still reads as a link.
+function entryIconClass(entry) {
+  if (!entry.is_link) return "";
+  return entry.link_broken ? " is-link link-broken" : " is-link";
+}
+
+function entrySizeLabel(entry) {
+  if (entry.is_dir) return "";
+  // A symlink's own size is the length of its target text, so hide it until the
+  // target size is known.
+  if (entry.is_link && (entry.link_broken || entry.link_unresolved)) return "";
+  return formatBytes(entry.size);
+}
+
+function entryTitle(entry) {
+  if (!entry.is_link) return entry.path;
+  const target = entry.link_target ? ` → ${entry.link_target}` : "";
+  if (entry.link_broken) return `${entry.path}${target}（链接目标不存在）`;
+  if (entry.link_unresolved) return `${entry.path}${target}（链接，正在解析目标）`;
+  return `${entry.path}${target}${entry.is_dir ? "（目录链接）" : ""}`;
 }
 
 function fileExtension(name) { return name.includes(".") ? name.split(".").pop().toLowerCase() : ""; }
@@ -1310,15 +1390,20 @@ function hasType(event, type) { return [...event.dataTransfer.types].includes(ty
 function clearDropTargets() { $$(".drop-target").forEach((node) => node.classList.remove("drop-target")); }
 
 async function openEditor(side, entry, providerID = "") {
-	if (state.editor?.saving) { toast("文件正在保存，请稍候"); return; }
-  if (state.editor?.dirty && !confirm("当前文件有未保存的修改，确定放弃并打开其他文件？")) return;
   const tab = currentTab(side);
   providerID = providerID || tab?.provider || "";
   if (!providerID) return;
-  releaseHTMLPreview(state.editor);
-  state.editor = null;
+  const loaded = state.preview.items.find((item) => item.kind === "text" && item.provider === providerID && item.path === entry.path && item.editor);
+  const item = openPreview("text", providerID, entry.path);
+  if (loaded) {
+    // Already open in another tab, so bring it forward instead of re-reading it.
+    applyPreview(item);
+    $("#editorContent").focus();
+    return;
+  }
   clearTimeout(editorPreviewTimer);
   closeEditorFind();
+  state.editor = null;
   const previewKind = isMarkdownPath(entry.path) ? "markdown" : (isHTMLPath(entry.path) ? "html" : "");
   setDocumentPreview(false, previewKind);
   $("#editorTitle").textContent = entry.path;
@@ -1331,10 +1416,9 @@ async function openEditor(side, entry, providerID = "") {
 	$("#editorFormat").textContent = "UTF-8";
   $("#editorState").textContent = "正在读取…";
   $("#saveEditor").disabled = true;
-  if (!$("#editorDialog").open) $("#editorDialog").showModal();
   try {
     const result = await api(`/api/v1/files/content?provider=${encodeURIComponent(providerID)}&path=${encodeURIComponent(entry.path)}`);
-    state.editor = {
+    const loadedEditor = {
 	  provider: providerID, path: entry.path, etag: result.etag, side, language: syntaxForPath(entry.path),
 	  originalContent: result.content, dirty: false, saving: false, encoding: result.encoding || "utf-8",
 	  bom: Boolean(result.bom), newline: result.newline || "lf", mixedNewlines: Boolean(result.mixed_newlines),
@@ -1342,6 +1426,11 @@ async function openEditor(side, entry, providerID = "") {
 	  previewKind, previewOpen: false, previewFocus: false, htmlPreviewToken: "", htmlPreviewSequence: 0,
 	  htmlViewportMode: "responsive", htmlViewportWidth: 1280, htmlViewportHeight: 720, htmlViewportScale: 1,
 	};
+    item.editor = loadedEditor;
+    item.text = { content: result.content, selectionStart: 0, selectionEnd: 0, scrollTop: 0, syntax: "auto" };
+    // The user may have switched to another tab while the file was loading.
+    if (state.preview.activeID !== item.id) return;
+    state.editor = loadedEditor;
     $("#editorTitle").textContent = entry.path;
 	$("#editorTitle").title = entry.path;
     $("#editorContent").value = result.content;
@@ -1349,8 +1438,10 @@ async function openEditor(side, entry, providerID = "") {
 	refreshEditorDisplay();
     $("#editorContent").focus();
   } catch (error) {
-    setDocumentPreview(false, "");
-    $("#editorState").textContent = `读取失败：${error.message}`;
+    if (state.preview.activeID === item.id) {
+      setDocumentPreview(false, "");
+      $("#editorState").textContent = `读取失败：${error.message}`;
+    }
     toast(error.message, "error");
   }
 }
@@ -1703,6 +1794,7 @@ function updateEditorStatus() {
 	$("#editorState").textContent = state.editor.saving ? "正在保存…" : (state.editor.dirty ? "已修改" : "未修改");
 	$("#editorDirty").classList.toggle("hidden", !state.editor.dirty);
 	$("#saveEditor").disabled = state.editor.saving || !state.editor.dirty;
+	syncPreviewTabDirty();
 }
 
 function editorChanged() {
@@ -1844,12 +1936,7 @@ function jumpToEditorLine() {
 }
 
 function requestCloseEditor() {
-	if (state.editor?.saving) { toast("文件正在保存，请稍候"); return; }
-	if (state.editor?.dirty && !confirm("文件尚未保存，确定不保存并关闭？")) return;
-	clearTimeout(editorPreviewTimer);
-	setDocumentPreview(false, "");
-	state.editor = null;
-	$("#editorDialog").close();
+	closePreviewWindow("text");
 }
 
 async function saveEditor() {
@@ -1879,10 +1966,14 @@ async function saveEditor() {
 }
 
 function toggleDialogMaximized(dialog, button) {
-  const maximized = dialog.classList.toggle("maximized");
-  button.innerHTML = '<span class="material-symbols-rounded" aria-hidden="true">fullscreen</span>';
-  button.title = maximized ? "还原窗口" : "窗口内全屏";
+  state.preview.maximized = !state.preview.maximized;
+  for (const selector of Object.values(PREVIEW_DIALOGS)) $(selector).classList.toggle("maximized", state.preview.maximized);
+  $$("#maximizeEditor, #maximizeImage, #maximizeMedia").forEach((control) => {
+    control.innerHTML = '<span class="material-symbols-rounded" aria-hidden="true">fullscreen</span>';
+    control.title = state.preview.maximized ? "还原窗口" : "窗口内全屏";
+  });
   if (dialog === $("#imageDialog") && state.image) requestAnimationFrame(fitImage);
+  if (dialog === $("#mediaDialog")) requestAnimationFrame(fitMediaPlayer);
   if (dialog === $("#editorDialog") && state.editor?.previewKind === "html") requestAnimationFrame(fitHTMLViewport);
 }
 
@@ -1890,10 +1981,9 @@ function openImage(side, entry) {
   const provider = currentProvider(side);
   const entries = state.panels[side].entries.filter((item) => !item.is_dir && isImageEntry(item));
   const index = Math.max(0, entries.findIndex((item) => item.path === entry.path));
-  state.image = { side, provider, entries, index, zoom: 1 };
-  const dialog = $("#imageDialog");
-  if (!dialog.open) dialog.showModal();
-  showImageAt(index);
+  const item = openPreview("image", provider, entry.path);
+  item.image = { ...(item.image || {}), side, provider, entries, index, zoom: item.image?.zoom || 1 };
+  applyPreview(item);
 }
 
 function showImageAt(index) {
@@ -1910,6 +2000,13 @@ function showImageAt(index) {
   $("#imagePosition").textContent = `${state.image.index + 1} / ${count}　${entry.name}`;
   $("#previousImage").disabled = count < 2;
   $("#nextImage").disabled = count < 2;
+  // Arrow keys walk the folder, so the tab has to follow the picture on screen.
+  const item = activePreview();
+  if (item?.kind === "image" && item.path !== entry.path) {
+    item.path = entry.path;
+    item.name = entry.name;
+    renderPreviewTabs();
+  }
 }
 
 function fitImage() {
@@ -1918,6 +2015,14 @@ function fitImage() {
   if (!image.naturalWidth || !image.naturalHeight) return;
   const zoom = Math.min(1, (stage.clientWidth - 40) / image.naturalWidth, (stage.clientHeight - 40) / image.naturalHeight);
   setImageZoom(Math.max(0.1, zoom));
+}
+
+function fitMediaPlayer() {
+  const player = $("#mediaPlayer"), stage = $(".media-stage");
+  if (!player.videoWidth || !player.videoHeight || !stage.clientWidth || !stage.clientHeight) return;
+  const scale = Math.min(1, stage.clientWidth / player.videoWidth, stage.clientHeight / player.videoHeight);
+  player.style.width = `${Math.max(1, Math.round(player.videoWidth * scale))}px`;
+  player.style.height = `${Math.max(1, Math.round(player.videoHeight * scale))}px`;
 }
 
 function setImageZoom(value) {
@@ -1940,47 +2045,76 @@ function mediaURL(provider, filePath) {
 }
 
 function openMedia(side, entry) {
-  closeMedia(false);
   const provider = currentProvider(side);
+  const item = openPreview("media", provider, entry.path);
+  item.media = {
+    ...(item.media || {}),
+    source: mediaURL(provider, entry.path),
+    hls: ["m3u8", "m3u"].includes(fileExtension(entry.name)),
+    currentTime: item.media?.currentTime || 0,
+    playing: item.media?.playing !== false,
+  };
+  startMediaSource(item);
+}
+
+// Loads (or reloads) one media tab into the single <video> element, seeking back to
+// where the tab was when it lost the player.
+function startMediaSource(item) {
+  closeMedia(false);
+  const loadSequence = mediaLoadSequence;
   const player = $("#mediaPlayer");
   const message = $("#mediaMessage");
-  const source = mediaURL(provider, entry.path);
-  $("#mediaTitle").textContent = entry.path;
-  $("#mediaTitle").title = entry.path;
+  const source = item.media.source;
+  const resumeAt = item.media.currentTime || 0;
+  const autoplay = item.media.playing !== false;
+  player.style.width = "100%";
+  player.style.height = "100%";
+  $("#mediaTitle").textContent = item.path;
+  $("#mediaTitle").title = item.path;
   $("#mediaState").textContent = "正在加载";
   message.classList.remove("visible");
   message.textContent = "";
-  const dialog = $("#mediaDialog");
-  if (!dialog.open) dialog.showModal();
-  const extension = fileExtension(entry.name);
-  if (["m3u8", "m3u"].includes(extension)) {
+  const fallbackLabel = item.media.hls ? "HLS · 点击播放" : "MP4 · 点击播放";
+  // currentTime only sticks once the metadata is in, so seek on that event rather
+  // than straight after assigning the source.
+  player.addEventListener("loadedmetadata", () => {
+    if (loadSequence !== mediaLoadSequence || activePreview()?.id !== item.id) return;
+    fitMediaPlayer();
+    if (resumeAt > 0.5 && Number.isFinite(player.duration) && resumeAt < player.duration) {
+      try { player.currentTime = resumeAt; } catch (_) { /* seeking is best effort */ }
+    }
+    if (autoplay) player.play().catch(() => { $("#mediaState").textContent = fallbackLabel; });
+  }, { once: true });
+  if (item.media.hls) {
     if (window.Hls?.isSupported()) {
-      const hls = new window.Hls({ enableWorker: true, lowLatencyMode: true, backBufferLength: 60 });
+      const hls = new window.Hls({ enableWorker: true, lowLatencyMode: true, backBufferLength: 60, startPosition: resumeAt > 0.5 ? resumeAt : -1 });
       state.hls = hls;
       hls.loadSource(source);
       hls.attachMedia(player);
       hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
+        if (loadSequence !== mediaLoadSequence || activePreview()?.id !== item.id) return;
         $("#mediaState").textContent = "HLS · 已就绪";
-        player.play().catch(() => { $("#mediaState").textContent = "HLS · 点击播放"; });
+        if (autoplay) player.play().catch(() => { $("#mediaState").textContent = "HLS · 点击播放"; });
       });
       hls.on(window.Hls.Events.ERROR, (_event, data) => {
+        if (loadSequence !== mediaLoadSequence || activePreview()?.id !== item.id) return;
         if (!data.fatal) return;
         const detail = `${data.type || "HLS"} / ${data.details || "未知错误"}`;
         showMediaError(`M3U8 播放失败：${detail}`);
-        reportClientLog("error", "media", "M3U8 播放失败", `${entry.path} · ${detail}`);
+        reportClientLog("error", "media", "M3U8 播放失败", `${item.path} · ${detail}`);
         if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
         else if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
       });
-    } else if (player.canPlayType("application/vnd.apple.mpegurl")) {
-      player.src = source;
-      player.play().catch(() => { $("#mediaState").textContent = "HLS · 点击播放"; });
-    } else {
-      showMediaError("当前浏览器不支持 HLS/M3U8 播放");
+      return;
     }
-  } else {
-    player.src = source;
-    player.play().catch(() => { $("#mediaState").textContent = "MP4 · 点击播放"; });
+    if (player.canPlayType("application/vnd.apple.mpegurl")) {
+      player.src = source;
+      return;
+    }
+    showMediaError("当前浏览器不支持 HLS/M3U8 播放");
+    return;
   }
+  player.src = source;
 }
 
 function showMediaError(message) {
@@ -1991,6 +2125,7 @@ function showMediaError(message) {
 }
 
 function closeMedia(closeDialog = true) {
+  mediaLoadSequence++;
   if (state.hls) {
     state.hls.destroy();
     state.hls = null;
@@ -2000,6 +2135,364 @@ function closeMedia(closeDialog = true) {
   player.removeAttribute("src");
   player.load();
   if (closeDialog && $("#mediaDialog").open) $("#mediaDialog").close();
+}
+
+const PREVIEW_DIALOGS = { text: "#editorDialog", image: "#imageDialog", media: "#mediaDialog" };
+const PREVIEW_KIND_LABELS = { text: "文本", image: "图片", media: "视频" };
+let previewSequence = 0;
+let previewMediaResume = false;
+let mediaLoadSequence = 0;
+
+function previewDialogFor(kind) { return PREVIEW_DIALOGS[kind] ? $(PREVIEW_DIALOGS[kind]) : null; }
+function findPreview(id) { return state.preview.items.find((item) => item.id === id); }
+function activePreview() { return findPreview(state.preview.activeID); }
+function previewHosts() { return $("#previewHosts"); }
+function previewName(filePath) { return filePath.split("/").filter(Boolean).pop() || filePath; }
+
+// close() queues its `close` event as a task instead of firing it synchronously, so
+// a plain flag would already be cleared by the time the listener runs. Mark the
+// dialog itself and let the listener consume the mark.
+function closeForRelocation(dialog) {
+  if (!dialog?.open) return;
+  dialog.dataset.previewRelocating = "1";
+  dialog.close();
+}
+
+// Opening a file adds a tab in whichever host the user last chose, so several
+// files can be previewed at once in the window as well as in the task area.
+function openPreview(kind, provider, path) {
+  let item = state.preview.items.find((entry) => entry.kind === kind && entry.provider === provider && entry.path === path);
+  const outgoing = activePreview();
+  if (!item) {
+    item = { id: `preview-${++previewSequence}`, kind, provider, path, name: previewName(path), editor: null, text: null, image: null, media: null };
+    state.preview.items.push(item);
+  }
+  item.provider = provider;
+  // Capture before the caller starts writing the new file into the shared dialog.
+  if (outgoing && outgoing.id !== item.id) capturePreview(outgoing);
+  // The dialog still holds the outgoing file, so point the live state at the
+  // incoming one before the host switch runs any fit or re-render pass.
+  state.editor = kind === "text" ? item.editor || null : null;
+  state.image = kind === "image" ? item.image || null : null;
+  state.preview.activeID = item.id;
+  hostPreviewDialog(kind);
+  renderPreviewTabs();
+  return item;
+}
+
+function activatePreview(id) {
+  const item = findPreview(id);
+  if (!item) return;
+  const outgoing = activePreview();
+  if (outgoing?.id === item.id) { hostPreviewDialog(item.kind); return; }
+  if (outgoing) capturePreview(outgoing);
+  state.preview.activeID = item.id;
+  hostPreviewDialog(item.kind);
+  applyPreview(item);
+  renderPreviewTabs();
+}
+
+function hostPreviewDialog(kind) {
+  if (state.preview.host === "panel") { mountPreviewInPanel(kind); return; }
+  const dialog = previewDialogFor(kind);
+  for (const otherKind of Object.keys(PREVIEW_DIALOGS)) {
+    if (otherKind === kind) continue;
+    const other = previewDialogFor(otherKind);
+    if (other?.open) closeForRelocation(other);
+  }
+  if (!dialog) return;
+  dialog.classList.toggle("maximized", state.preview.maximized);
+  if (dialog.parentElement === previewHosts()) {
+    closeForRelocation(dialog);
+    document.body.appendChild(dialog);
+  }
+  if (!dialog.open) dialog.showModal();
+}
+
+// There is one dialog per kind, so a tab switch means saving what the dialog holds
+// now and putting the other file's state back afterwards.
+function capturePreview(item, preserveMediaPlayback = false) {
+  if (!item) return;
+  if (item.kind === "text") {
+    if (state.editor) item.editor = state.editor;
+    const editor = $("#editorContent");
+    item.text = { content: editor.value, selectionStart: editor.selectionStart, selectionEnd: editor.selectionEnd, scrollTop: editor.scrollTop, syntax: $("#syntaxMode").value };
+  } else if (item.kind === "image") {
+    if (state.image) item.image = state.image;
+  } else if (item.kind === "media" && item.media) {
+    const player = $("#mediaPlayer");
+    item.media = { ...item.media, currentTime: player.currentTime || 0, playing: preserveMediaPlayback && !player.paused };
+    // One <video> element serves every tab, so the outgoing stream is torn down and
+    // rebuilt from the saved position when its tab comes back.
+    closeMedia(false);
+  }
+}
+
+function applyPreview(item) {
+  if (!item) return;
+  if (item.kind !== "text") state.editor = null;
+  if (item.kind !== "image") state.image = null;
+  if (item.kind === "text") applyTextPreview(item);
+  else if (item.kind === "image") applyImagePreview(item);
+  else if (item.kind === "media") applyMediaPreview(item);
+}
+
+function applyTextPreview(item) {
+  clearTimeout(editorPreviewTimer);
+  closeEditorFind();
+  state.editor = item.editor || null;
+  const editor = $("#editorContent");
+  editor.value = item.text?.content ?? "";
+  $("#syntaxMode").value = item.text?.syntax || "auto";
+  $("#editorTitle").textContent = item.path;
+  $("#editorTitle").title = item.path;
+  if (!state.editor) {
+    $("#editorHighlight").textContent = "";
+    $("#editorLineNumbers").textContent = "1";
+    $("#editorState").textContent = "正在读取…";
+    $("#saveEditor").disabled = true;
+    setDocumentPreview(false, isMarkdownPath(item.path) ? "markdown" : (isHTMLPath(item.path) ? "html" : ""));
+    return;
+  }
+  setDocumentPreview(state.editor.previewOpen, state.editor.previewKind);
+  // The cached count belongs to the file that was on screen a moment ago.
+  state.editor.lineCount = 0;
+  refreshEditorDisplay();
+  if (item.text) {
+    editor.setSelectionRange(item.text.selectionStart, item.text.selectionEnd);
+    editor.scrollTop = item.text.scrollTop;
+    syncEditorScroll();
+  }
+}
+
+function applyImagePreview(item) {
+  state.image = item.image || null;
+  if (state.image) showImageAt(state.image.index);
+}
+
+function applyMediaPreview(item) {
+  if (!item.media?.source) return;
+  startMediaSource(item);
+}
+
+function mountPreviewInPanel(kind) {
+  const dialog = previewDialogFor(kind), hosts = previewHosts();
+  if (!dialog) return;
+  state.preview.host = "panel";
+  for (const other of Object.keys(PREVIEW_DIALOGS)) {
+    const parked = previewDialogFor(other);
+    if (other !== kind && parked.open) closeForRelocation(parked);
+    if (other !== kind && parked.parentElement === hosts) document.body.appendChild(parked);
+  }
+  if (dialog.parentElement !== hosts) {
+    closeForRelocation(dialog);
+    hosts.appendChild(dialog);
+  }
+  if (!dialog.open) dialog.show();
+  state.taskFilter = "preview";
+  const queue = $("#transferQueue");
+  queue.classList.remove("collapsed");
+  const mainArea = $(".main-area");
+  const height = parseInt(getComputedStyle(mainArea).getPropertyValue("--queue-height"), 10) || 0;
+  // A preview needs far more room than a task row, so raise the floor once.
+  if (height < 300) mainArea.style.setProperty("--queue-height", "340px");
+  renderPreviewTabs();
+  renderTaskList();
+  restorePreviewViewState(kind);
+}
+
+// Moving the preview between window and tab mode keeps the same tab collection;
+// only the active kind's shared dialog changes parent and modal state.
+function setPreviewHost(host) {
+  const item = activePreview();
+  if (!item) return;
+  const restoreMedia = item.kind === "media" && Boolean(item.media?.source);
+  if (restoreMedia) capturePreview(item, true);
+  if (host === "panel") {
+    mountPreviewInPanel(item.kind);
+    if (restoreMedia) applyMediaPreview(item);
+    return;
+  }
+  state.preview.host = "dialog";
+  // Every parked dialog goes home too, so none is left orphaned and closed inside
+  // the panel while its tab still lists it.
+  for (const parked of [...previewHosts().children]) {
+    closeForRelocation(parked);
+    document.body.appendChild(parked);
+  }
+  hostPreviewDialog(item.kind);
+  if (state.taskFilter === "preview") state.taskFilter = "queue";
+  renderPreviewTabs();
+  renderTaskList();
+  restorePreviewViewState(item.kind);
+  if (restoreMedia) applyMediaPreview(item);
+}
+
+// Reparenting reloads an iframe and can interrupt a video, so the view state that
+// does not survive the move is rebuilt here.
+function restorePreviewViewState(kind) {
+  if (kind === "image" && state.image) requestAnimationFrame(fitImage);
+  if (kind === "text" && state.editor?.previewOpen && state.editor.previewKind === "html") {
+    renderHTMLPreview();
+    requestAnimationFrame(fitHTMLViewport);
+  }
+  if (kind === "media") {
+    requestAnimationFrame(fitMediaPlayer);
+    updatePreviewVisibility();
+  }
+}
+
+function previewVisible() {
+  return state.preview.host === "panel" && state.taskFilter === "preview" && !$("#transferQueue").classList.contains("collapsed");
+}
+
+// A preview tab the user cannot see must not keep streaming, but the buffer is
+// kept so playback resumes exactly where it stopped.
+function updatePreviewVisibility() {
+  if (state.preview.host !== "panel" || activePreview()?.kind !== "media") return;
+  if (!previewVisible()) pauseActiveMedia();
+}
+
+function pauseActiveMedia() {
+  const item = activePreview();
+  if (item?.kind !== "media") return;
+  const player = $("#mediaPlayer");
+  if (item.media) item.media = { ...item.media, currentTime: player.currentTime || item.media.currentTime || 0, playing: false };
+  previewMediaResume = false;
+  if (!player.paused) player.pause();
+  if ($("#mediaState").textContent === "正在播放") $("#mediaState").textContent = "已暂停";
+}
+
+function parkPreviewDialog(kind) {
+  const dialog = previewDialogFor(kind);
+  if (!dialog) return;
+  closeForRelocation(dialog);
+  if (dialog.parentElement === previewHosts()) document.body.appendChild(dialog);
+}
+
+function closePreviewItem(id) {
+  const item = findPreview(id);
+  if (!item) return;
+  const active = state.preview.activeID === item.id;
+  const editor = active && item.kind === "text" ? state.editor : item.editor;
+  if (item.kind === "text") {
+    if (editor?.saving) { toast("文件正在保存，请稍候"); return; }
+    if (editor?.dirty && !confirm(`${item.name} 尚未保存，确定不保存并关闭？`)) return;
+  }
+  if (active) {
+    if (item.kind === "text") { clearTimeout(editorPreviewTimer); setDocumentPreview(false, ""); state.editor = null; }
+    else if (item.kind === "image") state.image = null;
+    else if (item.kind === "media") { closeMedia(false); previewMediaResume = false; }
+  }
+  releaseHTMLPreview(editor);
+  state.preview.items = state.preview.items.filter((entry) => entry.id !== item.id);
+  if (!state.preview.items.some((entry) => entry.kind === item.kind)) parkPreviewDialog(item.kind);
+  if (!active) { renderPreviewTabs(); return; }
+  const next = state.preview.items[0];
+  state.preview.activeID = next?.id || "";
+  if (next) {
+    hostPreviewDialog(next.kind);
+    applyPreview(next);
+  }
+  renderPreviewTabs();
+}
+
+function closePreviewWindow(kind) {
+  const active = activePreview();
+  if (active) capturePreview(active);
+  const editors = state.preview.items.map((item) => item.editor).filter(Boolean);
+  if (editors.some((editor) => editor.saving)) { toast("文件正在保存，请稍候"); return; }
+  if (editors.some((editor) => editor.dirty) && !confirm("打开的文件有未保存的修改，确定全部关闭？")) return;
+  for (const previewKind of Object.keys(PREVIEW_DIALOGS)) {
+    const dialog = previewDialogFor(previewKind);
+    if (dialog?.open) {
+      dialog.dataset.previewWindowClosing = "1";
+      dialog.close();
+    }
+    if (dialog?.parentElement === previewHosts()) document.body.appendChild(dialog);
+  }
+  clearTimeout(editorPreviewTimer);
+  if (active?.kind === "text") {
+    setDocumentPreview(false, "");
+    state.editor = null;
+  } else if (active?.kind === "image") {
+    state.image = null;
+  } else if (active?.kind === "media") {
+    previewMediaResume = false;
+  }
+  for (const item of state.preview.items) releaseHTMLPreview(item.editor);
+  state.preview.items = [];
+  state.preview.activeID = "";
+  state.preview.host = "dialog";
+  state.preview.maximized = false;
+  renderPreviewTabs();
+  if (state.taskFilter === "preview") state.taskFilter = "queue";
+  renderTaskList();
+}
+
+function renderPreviewTabs() {
+  const items = state.preview.items;
+  const tab = $('.task-tab[data-task-filter="preview"]');
+  tab.hidden = !items.length;
+  $("#previewCount").textContent = String(items.length);
+  const strips = $$('[data-preview-strip]');
+  if (!items.length) {
+    strips.forEach((strip) => { strip.innerHTML = ""; });
+    updatePreviewTabNavigation();
+    if (state.taskFilter === "preview") { state.taskFilter = "queue"; renderTaskList(); }
+    return;
+  }
+  const markup = items.map((item) => {
+    const active = item.id === state.preview.activeID;
+    const dirty = item.kind === "text" && (active ? state.editor : item.editor)?.dirty === true;
+    return `<button type="button" class="preview-tab${active ? " active" : ""}" data-preview-id="${item.id}" title="${escapeHTML(item.path)}"><span class="preview-tab-kind">${escapeHTML(PREVIEW_KIND_LABELS[item.kind])}</span><b>${escapeHTML(item.name)}</b><em class="preview-dirty"${dirty ? "" : " hidden"}>●</em><i data-preview-close="${item.id}" title="关闭">×</i></button>`;
+  }).join("");
+  strips.forEach((strip) => { strip.innerHTML = markup; });
+  ensureActivePreviewTabVisible();
+  updatePreviewTabNavigation();
+}
+
+function ensureActivePreviewTabVisible() {
+  $$('[data-preview-strip]').forEach((tabs) => {
+    const active = tabs.querySelector('.preview-tab.active');
+    if (!active || !tabs.clientWidth) return;
+    const left = active.offsetLeft;
+    const right = left + active.offsetWidth;
+    if (left < tabs.scrollLeft) tabs.scrollLeft = left;
+    else if (right > tabs.scrollLeft + tabs.clientWidth) tabs.scrollLeft = right - tabs.clientWidth;
+  });
+}
+
+function updatePreviewTabNavigation() {
+  $$('[data-preview-tab-strip]').forEach((strip) => {
+    const tabs = strip.querySelector('[data-preview-strip]');
+    const previous = strip.querySelector('[data-preview-nav="previous"]');
+    const next = strip.querySelector('[data-preview-nav="next"]');
+    if (!tabs || !previous || !next) return;
+    const overflowing = tabs.scrollWidth > tabs.clientWidth + 1;
+    previous.disabled = !overflowing || tabs.scrollLeft <= 1;
+    next.disabled = !overflowing || tabs.scrollLeft + tabs.clientWidth >= tabs.scrollWidth - 1;
+  });
+}
+
+function handlePreviewTabNavigation(event) {
+  const button = event.target.closest('[data-preview-nav]');
+  if (!button || button.disabled) return;
+  const tabs = button.parentElement.querySelector('[data-preview-strip]');
+  if (!tabs) return;
+  const direction = button.dataset.previewNav === "next" ? 1 : -1;
+  tabs.scrollLeft += direction * Math.max(140, tabs.clientWidth * .7);
+  window.setTimeout(updatePreviewTabNavigation, 220);
+}
+
+// Called from the editor status refresh, so the tab marker tracks typing without
+// rebuilding the whole strip on every keystroke.
+function syncPreviewTabDirty() {
+  const item = activePreview();
+  if (item?.kind !== "text") return;
+  $$(`[data-preview-strip] .preview-tab[data-preview-id="${item.id}"] .preview-dirty`).forEach((marker) => {
+    marker.hidden = !state.editor?.dirty;
+  });
 }
 
 async function reportClientLog(level, category, message, detail) {
@@ -2361,7 +2854,10 @@ async function activateMemories() {
   const currentHeight = parseInt(getComputedStyle(mainArea).getPropertyValue("--queue-height"), 10) || 0;
   if (currentHeight < 260) mainArea.style.setProperty("--queue-height", "300px");
   renderTaskList();
-  if (!state.memoryLoaded) await loadMemories();
+  await Promise.all([
+    state.memoryLoaded ? Promise.resolve() : loadMemories(),
+    state.memorySearchHistoryLoaded ? Promise.resolve() : loadMemorySearchHistory(),
+  ]);
   requestAnimationFrame(() => $("#memorySearch").focus());
 }
 
@@ -2468,6 +2964,152 @@ async function loadMemories(query = $("#memorySearch")?.value || "") {
       renderMemoryPanel();
     }
   }
+}
+
+function sortMemorySearchHistory(items) {
+  return [...items].sort((left, right) => {
+    const rightTime = Date.parse(right.last_used_at) || 0;
+    const leftTime = Date.parse(left.last_used_at) || 0;
+    if (state.memorySearchHistorySort === "recent") {
+      if (rightTime !== leftTime) return rightTime - leftTime;
+      if (right.use_count !== left.use_count) return right.use_count - left.use_count;
+      return left.query.localeCompare(right.query);
+    }
+    if (right.use_count !== left.use_count) return right.use_count - left.use_count;
+    if (rightTime !== leftTime) return rightTime - leftTime;
+    return left.query.localeCompare(right.query);
+  }).slice(0, MEMORY_SEARCH_HISTORY_LIMIT);
+}
+
+async function loadMemorySearchHistory() {
+  try {
+    const items = await api(`/api/v1/memory-search-history?limit=${MEMORY_SEARCH_HISTORY_LIMIT}`);
+    state.memorySearchHistory = sortMemorySearchHistory(Array.isArray(items) ? items : []);
+    state.memorySearchHistoryLoaded = true;
+    renderMemorySearchHistory();
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+function renderMemorySearchHistory() {
+  const list = $("#memoryHistoryList");
+  if (!list) return;
+  const filter = $("#memoryHistoryFilter").value.trim().toLocaleLowerCase();
+  const items = sortMemorySearchHistory(state.memorySearchHistory).filter((item) => item.query.toLocaleLowerCase().includes(filter));
+  $$('[data-memory-history-sort]').forEach((button) => button.classList.toggle("active", button.dataset.memoryHistorySort === state.memorySearchHistorySort));
+  list.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "memory-history-empty";
+    empty.textContent = state.memorySearchHistory.length ? "没有匹配的历史词条" : "暂无历史搜索词条";
+    list.append(empty);
+    return;
+  }
+  for (const item of items) {
+    const row = document.createElement("div");
+    row.className = "memory-history-row";
+    const entry = document.createElement("button");
+    entry.type = "button";
+    entry.className = "memory-history-entry";
+    entry.dataset.memoryHistoryQuery = item.query;
+    const query = document.createElement("span");
+    query.className = "memory-history-query";
+    query.textContent = item.query;
+    const meta = document.createElement("span");
+    meta.className = "memory-history-meta";
+    meta.textContent = `${item.use_count} 次 · ${formatTime(item.last_used_at)}`;
+    entry.append(query, meta);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "memory-history-delete";
+    remove.dataset.memoryHistoryDelete = item.query;
+    remove.title = "删除历史词条";
+    remove.setAttribute("aria-label", `删除历史词条：${item.query}`);
+    remove.innerHTML = '<span class="material-symbols-rounded" aria-hidden="true">delete</span>';
+    row.append(entry, remove);
+    list.append(row);
+  }
+}
+
+function setMemorySearchHistoryOpen(open) {
+  const popover = $("#memorySearchHistory");
+  if (!popover) return;
+  state.memorySearchHistoryOpen = open;
+  popover.hidden = !open;
+  const toggle = $("#memoryHistoryToggle");
+  toggle?.setAttribute("aria-expanded", String(open));
+  toggle?.classList.toggle("active", open);
+  if (open) {
+    renderMemorySearchHistory();
+    if (!state.memorySearchHistoryLoaded) void loadMemorySearchHistory();
+  }
+}
+
+function recordMemorySearchHistory(query) {
+  query = query.trim();
+  if (!query) return;
+  memorySearchHistoryMutation = memorySearchHistoryMutation
+    .catch(() => {})
+    .then(async () => {
+      const item = await api("/api/v1/memory-search-history", {
+        method: "POST",
+        body: JSON.stringify({ query }),
+      });
+      const normalized = item.query.toLocaleLowerCase();
+      state.memorySearchHistory = sortMemorySearchHistory([
+        item,
+        ...state.memorySearchHistory.filter((entry) => entry.query.toLocaleLowerCase() !== normalized),
+      ]);
+      state.memorySearchHistoryLoaded = true;
+      renderMemorySearchHistory();
+    })
+    .catch((error) => toast(error.message, "error"));
+}
+
+function deleteMemorySearchHistory(query) {
+  memorySearchHistoryMutation = memorySearchHistoryMutation
+    .catch(() => {})
+    .then(async () => {
+      await api(`/api/v1/memory-search-history?query=${encodeURIComponent(query)}`, { method: "DELETE" });
+      const normalized = query.toLocaleLowerCase();
+      state.memorySearchHistory = state.memorySearchHistory.filter((item) => item.query.toLocaleLowerCase() !== normalized);
+      renderMemorySearchHistory();
+    })
+    .catch((error) => toast(error.message, "error"));
+}
+
+function resetMemorySearch(query) {
+  state.memoryMode = "view";
+  state.memories = [];
+  state.memorySelected = "";
+  state.memoryBlocks = [];
+  state.memoryAnchor = "";
+  state.memoryHasBefore = false;
+  state.memoryHasAfter = false;
+  state.memoryLoading = Boolean(query.trim());
+  $("#memoryClearSearch").hidden = !query;
+  renderMemoryPanel();
+  clearTimeout(memorySearchTimer);
+  memorySearchTimer = setTimeout(() => loadMemories(query), 180);
+}
+
+function handleMemoryHistoryClick(event) {
+  const remove = event.target.closest("[data-memory-history-delete]");
+  if (remove) {
+    event.preventDefault();
+    event.stopPropagation();
+    deleteMemorySearchHistory(remove.dataset.memoryHistoryDelete);
+    return;
+  }
+  const entry = event.target.closest("[data-memory-history-query]");
+  if (!entry) return;
+  const query = entry.dataset.memoryHistoryQuery;
+  $("#memorySearch").value = query;
+  resetMemorySearch(query);
+  recordMemorySearchHistory(query);
+  setMemorySearchHistoryOpen(false);
+  $("#memorySearch").focus();
 }
 
 function selectedMemory() { return state.memories.find((item) => item.hit_id === state.memorySelected); }
@@ -2591,6 +3233,7 @@ function renderMemoryDetail() {
 function renderMemoryPanel() {
   if (state.taskFilter !== "memories") return;
   $("#memoryClearSearch").hidden = !$("#memorySearch").value;
+  renderMemorySearchHistory();
   renderMemoryResults();
   renderMemoryDetail();
   const query = $("#memorySearch").value.trim();
@@ -2646,13 +3289,22 @@ async function loadMemoryStreamEdge(direction) {
 }
 
 function renderTaskList() {
+  if (state.taskFilter !== "memories" && state.memorySearchHistoryOpen) setMemorySearchHistoryOpen(false);
   $$(".task-tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.taskFilter === state.taskFilter));
   const list = $("#taskList");
 	const memoryPanel = $("#memoryPanel");
 	const clearButton = $("#clearTaskHistory");
 	const showingMemories = state.taskFilter === "memories";
-	list.hidden = showingMemories;
+	const showingPreview = state.taskFilter === "preview";
+	list.hidden = showingMemories || showingPreview;
 	memoryPanel.hidden = !showingMemories;
+	$("#previewPanel").hidden = !showingPreview;
+	updatePreviewVisibility();
+	if (showingPreview) {
+		clearButton.hidden = true;
+		$("#taskSummary").textContent = "支持多文件预览";
+		return;
+	}
 	if (showingMemories) {
 		clearButton.hidden = true;
 		renderMemoryPanel();
@@ -3455,7 +4107,8 @@ function initializeQueueResize() {
   });
   handle.addEventListener("pointermove", (event) => {
     if (!handle.hasPointerCapture(event.pointerId)) return;
-    const height = Math.max(90, Math.min(window.innerHeight * 0.65, window.innerHeight - event.clientY));
+    const minimum = state.preview.host === "panel" && state.taskFilter === "preview" ? 220 : 90;
+    const height = Math.max(minimum, Math.min(window.innerHeight * 0.65, window.innerHeight - event.clientY));
     mainArea.style.setProperty("--queue-height", `${height}px`);
   });
   handle.addEventListener("pointerup", (event) => {
@@ -3467,11 +4120,23 @@ function initializeQueueResize() {
   });
 }
 
+function initializePreviewResize() {
+  const observer = new ResizeObserver(() => {
+    if (state.preview.host !== "panel") return;
+    if (state.image) fitImage();
+    if (activePreview()?.kind === "media") fitMediaPlayer();
+  });
+  observer.observe($("#previewHosts"));
+  observer.observe($("#imageStage"));
+  observer.observe($(".media-stage"));
+}
+
 async function main() {
   try {
     await loadProviders(false); await loadBookmarks(); await loadTransferTemplates(); initializeWorkspace(); renderSessionTree();
 	    bindPanel("left"); bindPanel("right"); renderTabs("left"); renderTabs("right");
 	    initializeQueueResize();
+	    initializePreviewResize();
 	    initializeHTMLViewportResize();
 	await loadPanel("left");
 	await loadPanel("right");
@@ -3547,7 +4212,7 @@ $$('#connectionDialog .dialog-close, #connectionDialog .dialog-cancel').forEach(
 $$('#terminalMenu button[data-terminal-placement]').forEach((button) => button.addEventListener("click", () => launchTerminal(button.dataset.terminalPlacement)));
 $("#sessionSearch").addEventListener("input", renderSessionTree);
 $("#swapPanes").addEventListener("click", swapPanels);
-$("#closeEditor").addEventListener("click", requestCloseEditor);
+$("#closeEditor").addEventListener("click", () => closePreviewWindow("text"));
 $("#maximizeEditor").addEventListener("click", () => toggleDialogMaximized($("#editorDialog"), $("#maximizeEditor")));
 $("#editorPreviewToggle").addEventListener("click", () => setDocumentPreview(!state.editor?.previewOpen));
 $("#editorPreview").addEventListener("click", openMarkdownPreviewLink);
@@ -3599,6 +4264,7 @@ $("#syntaxMode").addEventListener("change", refreshEditorHighlight);
 $("#queueToggle").addEventListener("click", () => {
   if ($("#transferQueue").classList.contains("memory-fullscreen")) toggleMemoryFullscreen(false);
   else $("#transferQueue").classList.toggle("collapsed");
+  updatePreviewVisibility();
 });
 $$('.task-tab').forEach((tab) => tab.addEventListener("click", () => {
   if (tab.dataset.taskFilter === "memories") {
@@ -3606,25 +4272,64 @@ $$('.task-tab').forEach((tab) => tab.addEventListener("click", () => {
     return;
   }
   toggleMemoryFullscreen(false);
+  if (tab.dataset.taskFilter === "preview") {
+    const target = state.preview.activeID || state.preview.items[0]?.id;
+    if (target) activatePreview(target);
+    return;
+  }
   state.taskFilter = tab.dataset.taskFilter;
   $("#transferQueue").classList.remove("collapsed");
   renderTaskList();
 }));
-$("#memorySearch").addEventListener("input", (event) => {
-  const query = event.currentTarget.value;
-  state.memoryMode = "view";
-  state.memories = [];
-  state.memorySelected = "";
-  state.memoryBlocks = [];
-  state.memoryAnchor = "";
-  state.memoryHasBefore = false;
-  state.memoryHasAfter = false;
-  state.memoryLoading = Boolean(query.trim());
-  $("#memoryClearSearch").hidden = !query;
-  renderMemoryPanel();
-  clearTimeout(memorySearchTimer);
-  memorySearchTimer = setTimeout(() => loadMemories(query), 180);
+$("#collapseEditor").addEventListener("click", () => setPreviewHost("panel"));
+$("#collapseImage").addEventListener("click", () => setPreviewHost("panel"));
+$("#collapseMedia").addEventListener("click", () => setPreviewHost("panel"));
+$("#restorePreviewWindow").addEventListener("click", () => setPreviewHost("dialog"));
+function handlePreviewTabClick(event) {
+  const close = event.target.closest("[data-preview-close]");
+  if (close) { closePreviewItem(close.dataset.previewClose); return; }
+  const tab = event.target.closest("[data-preview-id]");
+  if (tab) activatePreview(tab.dataset.previewId);
+}
+$$('[data-preview-strip]').forEach((strip) => strip.addEventListener("click", handlePreviewTabClick));
+$$('[data-preview-tab-strip]').forEach((strip) => {
+  strip.addEventListener("click", handlePreviewTabNavigation);
+  strip.querySelector('[data-preview-strip]')?.addEventListener("scroll", updatePreviewTabNavigation, { passive: true });
 });
+window.addEventListener("resize", updatePreviewTabNavigation);
+for (const [kind, selector] of Object.entries(PREVIEW_DIALOGS)) {
+  // Escape and the native close button both end up here, so the tab strip stays in
+  // step with what is actually open.
+  $(selector).addEventListener("close", (event) => {
+    const dialog = event.currentTarget;
+    if (dialog.dataset.previewRelocating) { delete dialog.dataset.previewRelocating; return; }
+    if (dialog.dataset.previewWindowClosing) {
+      delete dialog.dataset.previewWindowClosing;
+      return;
+    }
+    closePreviewWindow(kind);
+  });
+}
+$("#memorySearch").addEventListener("blur", (event) => {
+  recordMemorySearchHistory(event.currentTarget.value);
+  window.setTimeout(() => {
+    if (!$("#memorySearchWrap").contains(document.activeElement)) setMemorySearchHistoryOpen(false);
+  }, 0);
+});
+$("#memorySearch").addEventListener("input", (event) => {
+  resetMemorySearch(event.currentTarget.value);
+});
+$("#memoryHistoryToggle").addEventListener("click", () => {
+  const open = !state.memorySearchHistoryOpen;
+  setMemorySearchHistoryOpen(open);
+  if (open) requestAnimationFrame(() => $("#memoryHistoryFilter").focus());
+});
+$("#memoryHistoryFilter").addEventListener("input", renderMemorySearchHistory);
+$("#memoryHistoryList").addEventListener("click", handleMemoryHistoryClick);
+$$('[data-memory-history-sort]').forEach((button) => button.addEventListener("click", () => {
+  state.memorySearchHistorySort = button.dataset.memoryHistorySort;
+  renderMemorySearchHistory();
+}));
 $("#memorySearch").addEventListener("keydown", (event) => {
   if (event.key === "ArrowDown" || event.key === "ArrowUp") {
     event.preventDefault();
@@ -3635,6 +4340,15 @@ $("#memorySearch").addEventListener("keydown", (event) => {
   } else if (event.key === "Enter" && selectedMemory()) {
     event.preventDefault();
     $("#memoryDetail").focus();
+  } else if (event.key === "Escape") {
+    setMemorySearchHistoryOpen(false);
+  }
+});
+$("#memoryHistoryFilter").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    setMemorySearchHistoryOpen(false);
+    $("#memorySearch").focus();
   }
 });
 $("#memoryClearSearch").addEventListener("click", () => {
@@ -3681,11 +4395,11 @@ $("#zoomOut").addEventListener("click", () => setImageZoom(state.image.zoom / 1.
 $("#zoomIn").addEventListener("click", () => setImageZoom(state.image.zoom * 1.2));
 $("#resetZoom").addEventListener("click", () => setImageZoom(1));
 $("#maximizeImage").addEventListener("click", () => toggleDialogMaximized($("#imageDialog"), $("#maximizeImage")));
-$("#closeImage").addEventListener("click", () => $("#imageDialog").close());
+$("#closeImage").addEventListener("click", () => closePreviewWindow("image"));
 $("#imageStage").addEventListener("wheel", (event) => { event.preventDefault(); setImageZoom(state.image.zoom * (event.deltaY < 0 ? 1.12 : 1 / 1.12)); }, { passive: false });
 $("#maximizeMedia").addEventListener("click", () => toggleDialogMaximized($("#mediaDialog"), $("#maximizeMedia")));
-$("#closeMedia").addEventListener("click", () => closeMedia());
-$("#mediaDialog").addEventListener("cancel", () => closeMedia(false));
+$("#closeMedia").addEventListener("click", () => closePreviewWindow("media"));
+$("#mediaDialog").addEventListener("cancel", (event) => { event.preventDefault(); closePreviewWindow("media"); });
 $("#mediaPlayer").addEventListener("playing", () => { $("#mediaState").textContent = "正在播放"; $("#mediaMessage").classList.remove("visible"); });
 $("#mediaPlayer").addEventListener("error", () => {
 	if (state.hls) return;
@@ -3695,7 +4409,7 @@ $("#mediaPlayer").addEventListener("error", () => {
 	reportClientLog("error", "media", "视频播放失败", detail);
 });
 window.addEventListener("beforeunload", (event) => {
-	if (!state.editor?.dirty) return;
+	if (!state.editor?.dirty && !state.preview.items.some((item) => item.editor?.dirty)) return;
 	event.preventDefault();
 	event.returnValue = "";
 });
@@ -3706,6 +4420,7 @@ document.addEventListener("mousedown", (event) => {
   if (!event.target.closest("#localTreePopup, .local-tree-button, .new-local-tab")) hideLocalTree();
   if (!event.target.closest("#bookmarkMenu, .bookmark-control")) hideBookmarkMenu();
   if (!event.target.closest("#terminalMenu, .terminal-button")) hideTerminalMenu();
+  if (!event.target.closest("#memorySearchWrap")) setMemorySearchHistoryOpen(false);
 });
 document.addEventListener("keydown", (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
@@ -3718,7 +4433,10 @@ document.addEventListener("keydown", (event) => {
     toggleMemoryFullscreen(false);
     return;
   }
-  if ($("#imageDialog").open) {
+  const imageDialog = $("#imageDialog");
+  // In tab mode the dialog stays open while the focus is elsewhere, so only take
+  // the arrow keys when the preview is the modal window or actually focused.
+  if (imageDialog.open && state.image && (imageDialog.parentElement === document.body || imageDialog.contains(event.target))) {
     if (event.key === "ArrowLeft") changeImage(-1);
     if (event.key === "ArrowRight") changeImage(1);
     if (event.key === "+" || event.key === "=") setImageZoom(state.image.zoom * 1.2);
@@ -3740,7 +4458,8 @@ document.addEventListener("keydown", (event) => {
   }
   if (locateEntryByKey(state.activePane, event.key)) event.preventDefault();
 });
-window.addEventListener("blur", () => { hideContextMenu(); hideLocalTree(); hideBookmarkMenu(); hideTerminalMenu(); });
+window.addEventListener("blur", () => { hideContextMenu(); hideLocalTree(); hideBookmarkMenu(); hideTerminalMenu(); pauseActiveMedia(); });
+document.addEventListener("visibilitychange", () => { if (document.hidden) pauseActiveMedia(); });
 setInterval(() => {
   if (state.taskFilter === "queue" && state.tasks.some((task) => ["running", "verifying"].includes(task.status))) renderTaskList();
 }, 1000);

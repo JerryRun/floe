@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/textproto"
 	"path"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -160,15 +159,50 @@ func (f *FTPFS) listLocked(remotePath string) ([]Entry, error) {
 			Name: item.Name, Path: path.Join(remotePath, item.Name), Size: int64(item.Size),
 			Mode: ftpMode(item.Type), Modified: item.Time,
 			IsDir: item.Type == ftpclient.EntryTypeFolder, IsLink: item.Type == ftpclient.EntryTypeLink,
+			// One mutex-guarded control connection serves every FTP request, so
+			// probing each link here would serialise behind the listing. Servers
+			// that speak MLSD already report a symlinked directory as a
+			// directory; the rest are resolved on demand.
+			LinkTarget:     item.Target,
+			LinkUnresolved: item.Type == ftpclient.EntryTypeLink,
 		})
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].IsDir != entries[j].IsDir {
-			return entries[i].IsDir
-		}
-		return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
-	})
+	sortEntries(entries)
 	return entries, nil
+}
+
+// ResolveLink probes one symlink with ChangeDir, the cheapest FTP request that
+// distinguishes a directory from a file.
+func (f *FTPFS) ResolveLink(remotePath string) (string, FileInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	remotePath = cleanRemote(remotePath)
+	isDir := false
+	err := f.retryLocked(func(client *ftpclient.ServerConn) error {
+		current, err := client.CurrentDir()
+		if err != nil {
+			return err
+		}
+		if err := client.ChangeDir(remotePath); err != nil {
+			// Not a directory, or unreachable. Fall through to the file branch
+			// instead of failing the whole request.
+			isDir = false
+			return nil
+		}
+		isDir = true
+		return client.ChangeDir(current)
+	})
+	if err != nil {
+		return "", FileInfo{}, err
+	}
+	if isDir {
+		return "", FileInfo{IsDir: true}, nil
+	}
+	info, err := f.statLocked(remotePath)
+	if err != nil {
+		return "", FileInfo{}, err
+	}
+	return "", info, nil
 }
 
 func ftpMode(kind ftpclient.EntryType) string {
@@ -184,7 +218,10 @@ func ftpMode(kind ftpclient.EntryType) string {
 func (f *FTPFS) Stat(remotePath string) (FileInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	remotePath = cleanRemote(remotePath)
+	return f.statLocked(cleanRemote(remotePath))
+}
+
+func (f *FTPFS) statLocked(remotePath string) (FileInfo, error) {
 	if remotePath == "/" {
 		return FileInfo{IsDir: true}, nil
 	}

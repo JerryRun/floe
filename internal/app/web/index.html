@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light">
   <title>Floe</title>
   <link rel="icon" type="image/png" href="/assets/floe-64.png?v=3">
-  <link rel="stylesheet" href="/styles.css?v=13">
+  <link rel="stylesheet" href="/styles.css?v=19">
 </head>
 <body>
   <div class="app-shell">
@@ -75,6 +75,7 @@
             <button class="task-tab" data-task-filter="success">成功 <span id="successCount">0</span></button>
             <button class="task-tab" data-task-filter="failed">失败 <span id="failedCount">0</span></button>
             <button class="task-tab" data-task-filter="logs">日志 <span id="logCount">0</span></button>
+            <button class="task-tab preview-tab" data-task-filter="preview" hidden>预览 <span id="previewCount">0</span></button>
             <button class="task-tab memory-tab" data-task-filter="memories">速查</button>
           </div>
           <span id="taskSummary">暂无任务</span>
@@ -84,7 +85,16 @@
         <div class="task-list" id="taskList"><div class="empty-row">拖动文件到另一侧开始传输</div></div>
         <section class="memory-panel" id="memoryPanel" hidden>
           <div class="memory-toolbar">
-            <label class="memory-search"><span class="material-symbols-rounded" aria-hidden="true">search</span><input id="memorySearch" autocomplete="off" placeholder='搜索文字或命令，使用 "..." 精确匹配'><button type="button" id="memoryClearSearch" title="清空搜索" aria-label="清空搜索" hidden><span class="material-symbols-rounded" aria-hidden="true">close</span></button></label>
+            <div class="memory-search-wrap" id="memorySearchWrap">
+              <label class="memory-search"><span class="material-symbols-rounded" aria-hidden="true">search</span><input id="memorySearch" autocomplete="off" placeholder='搜索文字或命令，使用 "..." 精确匹配'><button type="button" id="memoryClearSearch" title="清空搜索" aria-label="清空搜索" hidden><span class="material-symbols-rounded" aria-hidden="true">close</span></button><button type="button" class="memory-history-toggle" id="memoryHistoryToggle" title="显示搜索历史" aria-label="显示搜索历史" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 9 5 5 5-5"/></svg></button></label>
+              <div class="memory-history-popover" id="memorySearchHistory" hidden>
+                <div class="memory-history-head">
+                  <label class="memory-history-filter"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="5.8"/><path d="m15.2 15.2 4.3 4.3"/></svg><input id="memoryHistoryFilter" autocomplete="off" placeholder="检索历史词条" aria-label="检索历史词条"></label>
+                  <span class="memory-history-sort" role="group" aria-label="历史词条排序"><button type="button" class="active" data-memory-history-sort="frequency">频率</button><button type="button" data-memory-history-sort="recent">最近</button></span>
+                </div>
+                <div class="memory-history-list" id="memoryHistoryList" role="listbox" aria-label="历史搜索词条"></div>
+              </div>
+            </div>
             <button type="button" id="memoryNew"><span class="material-symbols-rounded" aria-hidden="true">add</span><span>随手记</span></button>
             <button type="button" id="memoryImport"><span class="material-symbols-rounded" aria-hidden="true">upload</span><span>导入</span></button>
             <button type="button" id="memoryLocation"><span class="material-symbols-rounded" aria-hidden="true">folder</span><span>位置</span></button>
@@ -95,6 +105,17 @@
             <div class="memory-results" id="memoryResults" role="listbox" aria-label="速查结果"></div>
             <div class="memory-detail" id="memoryDetail" tabindex="0"></div>
           </div>
+        </section>
+        <section class="preview-panel" id="previewPanel" hidden>
+          <div class="preview-head">
+            <div class="preview-tab-strip" data-preview-tab-strip>
+              <button type="button" class="preview-tab-nav" data-preview-nav="previous" title="上一个预览标签" aria-label="上一个预览标签"><span class="material-symbols-rounded" aria-hidden="true">chevron_left</span></button>
+              <div class="preview-tabs" id="previewTabs" data-preview-strip></div>
+              <button type="button" class="preview-tab-nav" data-preview-nav="next" title="下一个预览标签" aria-label="下一个预览标签"><span class="material-symbols-rounded" aria-hidden="true">chevron_right</span></button>
+            </div>
+            <button type="button" id="restorePreviewWindow" title="还原为窗口"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span><span>还原为窗口</span></button>
+          </div>
+          <div class="preview-hosts" id="previewHosts"></div>
         </section>
       </section>
     </main>
@@ -149,20 +170,13 @@
   </dialog>
 
   <dialog id="editorDialog" class="dialog editor-dialog">
-    <div class="editor-head">
-	  <span class="editor-title"><span id="editorDirty" class="editor-dirty hidden" title="有未保存的修改">●</span><strong id="editorTitle">文件</strong></span>
-      <span class="dialog-head-actions">
-		<button id="editorPreviewToggle" class="editor-preview-toggle hidden" title="打开预览" aria-label="打开预览" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.4 12s3.5-6 9.6-6 9.6 6 9.6 6-3.5 6-9.6 6-9.6-6-9.6-6Zm9.6 3.4a3.4 3.4 0 1 0 0-6.8 3.4 3.4 0 0 0 0 6.8Zm0-1.8a1.6 1.6 0 1 1 0-3.2 1.6 1.6 0 0 1 0 3.2Z"/></svg><span>预览</span></button>
-		<button id="editorSearch" title="查找 (Ctrl+F)" aria-label="查找"><span class="material-symbols-rounded" aria-hidden="true">search</span></button>
-        <select id="syntaxMode" title="语法高亮">
-          <option value="auto">自动识别</option><option value="plain">纯文本</option>
-          <option value="json">JSON</option><option value="yaml">YAML</option><option value="markdown">Markdown</option>
-          <option value="javascript">JavaScript / TypeScript</option><option value="python">Python</option><option value="go">Go</option>
-          <option value="rust">Rust</option><option value="shell">Shell / PowerShell</option><option value="markup">HTML / XML</option>
-          <option value="css">CSS</option><option value="sql">SQL</option><option value="c">C / C++</option>
-        </select>
-        <button id="maximizeEditor" title="窗口内全屏" aria-label="窗口内全屏"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button><button id="closeEditor" aria-label="关闭"><span class="material-symbols-rounded" aria-hidden="true">close</span></button>
-      </span>
+    <div class="preview-window-bar">
+      <div class="preview-tab-strip" data-preview-tab-strip>
+        <button type="button" class="preview-tab-nav" data-preview-nav="previous" title="上一个预览标签" aria-label="上一个预览标签"><span class="material-symbols-rounded" aria-hidden="true">chevron_left</span></button>
+        <div class="preview-tabs dialog-preview-tabs" data-preview-strip></div>
+        <button type="button" class="preview-tab-nav" data-preview-nav="next" title="下一个预览标签" aria-label="下一个预览标签"><span class="material-symbols-rounded" aria-hidden="true">chevron_right</span></button>
+      </div>
+      <span class="preview-window-actions"><button id="collapseEditor" class="collapse-preview" title="收到任务栏标签页" aria-label="收到任务栏标签页"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button><button id="maximizeEditor" class="window-only" title="窗口内全屏" aria-label="窗口内全屏"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button><button id="closeEditor" aria-label="关闭全部预览"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></span>
     </div>
 	<div id="editorFindBar" class="editor-find hidden">
 	  <span class="material-symbols-rounded" aria-hidden="true">search</span>
@@ -198,34 +212,36 @@
 		</section>
 	  </aside>
 	</div>
-	<div class="editor-foot"><span class="editor-status"><button id="editorPosition" title="跳转到行 (Ctrl+G)">Ln 1, Col 1</button><span id="editorFormat">UTF-8 · LF</span><span id="editorState">未修改</span></span><button class="primary" id="saveEditor">保存</button></div>
+	<div class="editor-foot preview-bottom-bar">
+      <div class="preview-file-meta"><span class="editor-title"><span id="editorDirty" class="editor-dirty hidden" title="有未保存的修改">●</span><strong id="editorTitle">文件</strong></span><span class="editor-status"><button id="editorPosition" title="跳转到行 (Ctrl+G)">Ln 1, Col 1</button><span id="editorFormat">UTF-8 · LF</span><span id="editorState">未修改</span></span></div>
+      <span class="preview-footer-actions"><button id="editorPreviewToggle" class="editor-preview-toggle hidden" title="打开预览" aria-label="打开预览" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.4 12s3.5-6 9.6-6 9.6 6 9.6 6-3.5 6-9.6 6-9.6-6-9.6-6Zm9.6 3.4a3.4 3.4 0 1 0 0-6.8 3.4 3.4 0 0 0 0 6.8Zm0-1.8a1.6 1.6 0 1 1 0-3.2 1.6 1.6 0 0 1 0 3.2Z"/></svg><span>预览</span></button><button id="editorSearch" title="查找 (Ctrl+F)" aria-label="查找"><span class="material-symbols-rounded" aria-hidden="true">search</span></button><select id="syntaxMode" title="语法高亮"><option value="auto">自动识别</option><option value="plain">纯文本</option><option value="json">JSON</option><option value="yaml">YAML</option><option value="markdown">Markdown</option><option value="javascript">JavaScript / TypeScript</option><option value="python">Python</option><option value="go">Go</option><option value="rust">Rust</option><option value="shell">Shell / PowerShell</option><option value="markup">HTML / XML</option><option value="css">CSS</option><option value="sql">SQL</option><option value="c">C / C++</option></select><button class="primary" id="saveEditor">保存</button></span>
+    </div>
   </dialog>
 
   <dialog id="imageDialog" class="dialog image-dialog">
-    <div class="image-head">
-      <strong id="imageTitle">图片</strong>
-      <div class="image-tools">
-        <button id="previousImage" title="上一张" aria-label="上一张"><span class="material-symbols-rounded" aria-hidden="true">chevron_left</span></button>
-        <button id="zoomOut" title="缩小" aria-label="缩小"><span class="material-symbols-rounded" aria-hidden="true">zoom_out</span></button>
-        <span id="zoomLabel">100%</span>
-        <button id="zoomIn" title="放大" aria-label="放大"><span class="material-symbols-rounded" aria-hidden="true">zoom_in</span></button>
-        <button id="resetZoom" title="恢复大小">1:1</button>
-        <button id="nextImage" title="下一张" aria-label="下一张"><span class="material-symbols-rounded" aria-hidden="true">chevron_right</span></button>
-        <button id="maximizeImage" title="窗口内全屏" aria-label="窗口内全屏"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button>
-        <button id="closeImage" title="关闭" aria-label="关闭"><span class="material-symbols-rounded" aria-hidden="true">close</span></button>
+    <div class="preview-window-bar">
+      <div class="preview-tab-strip" data-preview-tab-strip>
+        <button type="button" class="preview-tab-nav" data-preview-nav="previous" title="上一个预览标签" aria-label="上一个预览标签"><span class="material-symbols-rounded" aria-hidden="true">chevron_left</span></button>
+        <div class="preview-tabs dialog-preview-tabs" data-preview-strip></div>
+        <button type="button" class="preview-tab-nav" data-preview-nav="next" title="下一个预览标签" aria-label="下一个预览标签"><span class="material-symbols-rounded" aria-hidden="true">chevron_right</span></button>
       </div>
+      <span class="preview-window-actions"><button id="collapseImage" class="collapse-preview" title="收到任务栏标签页" aria-label="收到任务栏标签页"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button><button id="maximizeImage" class="window-only" title="窗口内全屏" aria-label="窗口内全屏"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button><button id="closeImage" title="关闭全部预览" aria-label="关闭全部预览"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></span>
     </div>
     <div class="image-stage" id="imageStage"><img id="imagePreview" alt=""></div>
-    <div class="image-foot"><span id="imagePosition"></span><span>滚轮缩放 · ← → 切换</span></div>
+    <div class="image-foot preview-bottom-bar"><div class="preview-file-meta"><strong id="imageTitle">图片</strong><span id="imagePosition"></span></div><div class="image-tools preview-footer-actions"><button id="previousImage" title="上一张" aria-label="上一张"><span class="material-symbols-rounded" aria-hidden="true">chevron_left</span></button><button id="zoomOut" title="缩小" aria-label="缩小"><span class="material-symbols-rounded" aria-hidden="true">zoom_out</span></button><span id="zoomLabel">100%</span><button id="zoomIn" title="放大" aria-label="放大"><span class="material-symbols-rounded" aria-hidden="true">zoom_in</span></button><button id="resetZoom" title="恢复大小">1:1</button><button id="nextImage" title="下一张" aria-label="下一张"><span class="material-symbols-rounded" aria-hidden="true">chevron_right</span></button></div></div>
   </dialog>
 
   <dialog id="mediaDialog" class="dialog media-dialog">
-    <div class="media-head">
-      <strong id="mediaTitle">视频</strong>
-      <span class="dialog-head-actions"><button id="maximizeMedia" title="窗口内全屏" aria-label="窗口内全屏"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button><button id="closeMedia" title="关闭" aria-label="关闭"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></span>
+    <div class="preview-window-bar">
+      <div class="preview-tab-strip" data-preview-tab-strip>
+        <button type="button" class="preview-tab-nav" data-preview-nav="previous" title="上一个预览标签" aria-label="上一个预览标签"><span class="material-symbols-rounded" aria-hidden="true">chevron_left</span></button>
+        <div class="preview-tabs dialog-preview-tabs" data-preview-strip></div>
+        <button type="button" class="preview-tab-nav" data-preview-nav="next" title="下一个预览标签" aria-label="下一个预览标签"><span class="material-symbols-rounded" aria-hidden="true">chevron_right</span></button>
+      </div>
+      <span class="preview-window-actions"><button id="collapseMedia" class="collapse-preview" title="收到任务栏标签页" aria-label="收到任务栏标签页"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button><button id="maximizeMedia" class="window-only" title="窗口内全屏" aria-label="窗口内全屏"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button><button id="closeMedia" title="关闭全部预览" aria-label="关闭全部预览"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></span>
     </div>
     <div class="media-stage"><video id="mediaPlayer" controls playsinline></video><div id="mediaMessage"></div></div>
-    <div class="media-foot"><span id="mediaState">准备播放</span></div>
+    <div class="media-foot preview-bottom-bar"><div class="preview-file-meta"><strong id="mediaTitle">视频</strong><span id="mediaState">准备播放</span></div></div>
   </dialog>
 
   <dialog id="transferOptionsDialog" class="dialog transfer-options-dialog">
@@ -283,6 +299,6 @@
   <script src="/assets/hls.min.js" defer></script>
   <script src="/assets/vendor/marked.min.js" defer></script>
   <script src="/assets/vendor/purify.min.js" defer></script>
-  <script src="/app.js?v=12" defer></script>
+  <script src="/app.js?v=19" defer></script>
 </body>
 </html>

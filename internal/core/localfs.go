@@ -6,7 +6,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 )
 
@@ -107,13 +106,30 @@ func (l *LocalFS) List(path string) ([]Entry, error) {
 			IsLink: item.Type()&fs.ModeSymlink != 0,
 		})
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].IsDir != entries[j].IsDir {
-			return entries[i].IsDir
-		}
-		return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
-	})
+	// os.ReadDir reports the link's own type, so resolve targets before sorting
+	// to keep a symlinked directory grouped with the directories.
+	resolveLinkEntries(entries, linkResolveBudget, linkResolveWorkers, l.Stat, l.readLink)
+	sortEntries(entries)
 	return entries, nil
+}
+
+func (l *LocalFS) readLink(path string) (string, error) {
+	full, err := l.resolve(path)
+	if err != nil {
+		return "", err
+	}
+	return os.Readlink(full)
+}
+
+// ResolveLink reports one symlink's target, used for entries a large listing
+// left unresolved.
+func (l *LocalFS) ResolveLink(path string) (string, FileInfo, error) {
+	target, _ := l.readLink(path)
+	info, err := l.Stat(path)
+	if err != nil {
+		return target, FileInfo{}, err
+	}
+	return target, info, nil
 }
 
 func (l *LocalFS) Stat(path string) (FileInfo, error) {

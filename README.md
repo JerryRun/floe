@@ -43,7 +43,7 @@ Floe 面向在 Windows 上管理 Linux 服务器、支持 SFTP/FTP 的 NAS 和�
 
 ### Ctrl+K Server Quick Reference
 
-按 `Ctrl+K` 随时搜索或记录部署命令、服务器地址、账号说明、配置文件位置和故障处理步骤。速查内容在本机加密保存，让服务器文件、SSH 操作和运维知识留在同一个工作区。
+按 `Ctrl+K` 随时搜索或记录部署命令、服务器地址、账号说明、配置文件位置和故障处理步骤。速查内容保存在本机 SQLite 知识库中，让服务器文件、SSH 操作和运维知识留在同一个工作区。
 
 ## Built for reliable transfers
 
@@ -51,7 +51,7 @@ Floe 面向在 Windows 上管理 Linux 服务器、支持 SFTP/FTP 的 NAS 和�
 - **暂停与恢复**：传输队列支持暂停、恢复、删除和分类查看历史任务。
 - **冲突处理**：支持覆盖、跳过、仅源文件更新时覆盖、自动重命名或逐个询问。
 - **主机指纹确认**：首次连接 SFTP 服务器时显示并确认 SHA-256 主机指纹，已记录主机的密钥变化会被拒绝。
-- **本地凭据加密**：会话密码和速查内容使用本机随机 AES-GCM 密钥加密保存，不写入明文。
+- **本地凭据加密**：会话密码使用本机随机 AES-GCM 密钥加密保存，不写入明文。
 - **可追踪错误**：操作日志记录连接、目录读取、传输、编辑和媒体播放错误的具体原因。
 
 ## Product preview
@@ -166,7 +166,7 @@ Server  ↔ NAS
 - 使用 `Ctrl+K` 搜索或记录命令、地址、账号和操作说明。
 - 支持智能短语、双引号精确搜索、按命中位置加载统一上下文、敏感字段隐藏和全文编辑。
 - 支持选中文字快速复制、长内容全屏阅读，以及文本或 Markdown 文件导入。
-- 速查内容使用独立 AES-GCM 密钥加密保存，并可将知识库移动到自定义目录。
+- 速查内容使用本机 SQLite FTS5 索引搜索，并可将知识库移动到自定义目录。
 
 ### 使用命令行
 
@@ -209,9 +209,11 @@ Floe 的工作区由本机 Core 提供，运行数据默认保存在 `%LOCALAPPD
 | `activity.json` | 最多 1000 条操作日志 |
 | `transfer-templates.json` | 发布和传输模板 |
 | `settings.json` | 启动和知识库位置设置 |
-| `memories.json` / `memory.key` | 加密的速查内容及密钥 |
+| `memories.db` | 速查内容、元数据及 SQLite FTS5 搜索索引 |
 
-速查知识库可以移动到自定义目录。Floe 支持复制当前知识库后切换，也可以直接打开目标目录中已有的知识库。
+速查知识库可以移动到自定义目录。Floe 支持复制当前知识库后切换，也可以直接打开目标目录中已有的知识库。升级后首次启动会自动将旧的 `memories.json` 与 `memory.key` 导入 `memories.db`，旧文件保留作为迁移备份。
+
+当前 `memories.db` 未启用数据库页级加密，请不要在速查中长期保存明文密码、私钥等高敏感凭据。界面仍会隐藏常见密码字段，并禁止通过密码值搜索。
 
 ## Current limitations
 
@@ -242,7 +244,8 @@ Floe 启动后在本机提供工作区。需要独立窗口和任务栏图标时
 
 ```bash
 cd floe
-GOPATH="$PWD/.cache/gopath" GOCACHE="$PWD/.cache/go-build" go run ./cmd/floe
+GOPATH="$PWD/.cache/gopath" GOCACHE="$PWD/.cache/go-build" \
+  go run ./cmd/floe
 ```
 
 如果当前环境无法自动打开浏览器：

@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -144,13 +143,24 @@ func (s *SFTPFS) List(remotePath string) ([]Entry, error) {
 			IsLink: item.Mode()&os.ModeSymlink != 0,
 		})
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].IsDir != entries[j].IsDir {
-			return entries[i].IsDir
-		}
-		return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
-	})
+	// ReadDir reports the link's own attributes, so a symlink to a directory
+	// would look like a file. Resolve the targets on the control connection
+	// before sorting, which also puts link-to-directory rows in the right group.
+	resolveLinkEntries(entries, linkResolveBudget, linkResolveWorkers, s.Stat, s.client.ReadLink)
+	sortEntries(entries)
 	return entries, nil
+}
+
+// ResolveLink reports one symlink's target, used for entries a large listing
+// left unresolved.
+func (s *SFTPFS) ResolveLink(remotePath string) (string, FileInfo, error) {
+	remotePath = cleanRemote(remotePath)
+	target, _ := s.client.ReadLink(remotePath)
+	info, err := s.Stat(remotePath)
+	if err != nil {
+		return target, FileInfo{}, err
+	}
+	return target, info, nil
 }
 
 func (s *SFTPFS) Stat(remotePath string) (FileInfo, error) {
