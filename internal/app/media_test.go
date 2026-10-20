@@ -25,3 +25,14 @@ func TestRewriteHLSPlaylistKeepsExternalURI(t *testing.T) {
 		t.Fatalf("external URI was changed: %s", result)
 	}
 }
+
+func TestRewriteHLSPlaylistReloadIncludesSegmentsKeysAndChildPlaylists(t *testing.T) {
+	input := "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\nsegment.ts\nchild.m3u8\nhttps://cdn.example.test/video.ts\n"
+	result := rewriteHLSPlaylist(input, "local", "/video/master.m3u8", "123")
+	if strings.Count(result, "&reload=123") != 3 {
+		t.Fatalf("reload revision did not reach every provider resource: %s", result)
+	}
+	if !strings.Contains(result, "https://cdn.example.test/video.ts\n") {
+		t.Fatalf("external URI was changed: %s", result)
+	}
+}

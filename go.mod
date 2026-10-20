@@ -3,6 +3,7 @@ module floe
 go 1.24.0
 
 require (
+	github.com/itchyny/gojq v0.12.17
 	github.com/jlaffaye/ftp v0.2.0
 	github.com/ncruces/go-sqlite3 v0.29.1
 	github.com/pkg/sftp v1.13.7
@@ -13,6 +14,7 @@ require (
 require (
 	github.com/hashicorp/errwrap v1.0.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
+	github.com/itchyny/timefmt-go v0.1.6 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/ncruces/julianday v1.0.0 // indirect
 	github.com/tetratelabs/wazero v1.9.0 // indirect

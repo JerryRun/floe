@@ -204,9 +204,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .file-pane.drop-target .drop-mask { display: grid; }
 
 .transfer-queue { min-height: 0; position: relative; display: grid; grid-template-rows: 31px minmax(0, 1fr); background: var(--panel); border-top: 1px solid var(--line); }
-.transfer-queue.memory-fullscreen { position: fixed; z-index: 75; inset: 0; border: 0; grid-template-rows: 31px minmax(0, 1fr); }
+.transfer-queue.memory-fullscreen, .transfer-queue.toolbox-fullscreen { position: fixed; z-index: 75; inset: 0; border: 0; grid-template-rows: 31px minmax(0, 1fr); }
 .transfer-queue.collapsed { grid-template-rows: 31px 0; }
-.transfer-queue.collapsed .task-list, .transfer-queue.collapsed .memory-panel, .transfer-queue.collapsed .preview-panel { display: none; }
+.transfer-queue.collapsed .task-list, .transfer-queue.collapsed .memory-panel, .transfer-queue.collapsed .preview-panel, .transfer-queue.collapsed .toolbox-panel { display: none; }
 .queue-resizer { position: absolute; z-index: 6; top: -4px; left: 0; right: 0; height: 8px; cursor: ns-resize; }
 .queue-resizer:hover::after, .queue-resizer.dragging::after { content: ""; position: absolute; top: 3px; left: 0; right: 0; height: 2px; background: var(--accent); }
 .queue-head { min-width: 0; display: flex; align-items: stretch; background: var(--chrome); }

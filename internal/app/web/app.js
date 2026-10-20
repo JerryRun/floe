@@ -465,6 +465,7 @@ function showSessionMenu(event, provider) {
     { label: provider.connected ? "在右侧打开" : "连接并打开", action: () => openSession("right", provider.id) },
     { label: "查看 / 修改配置", action: () => editSession(provider.id) },
     { label: "复制会话", action: () => copySession(provider) },
+    ...(provider.host ? [{ label: /^[\d.]+$/.test(provider.host) || provider.host.includes(":") ? "复制 IP" : "复制主机地址", action: () => copyText(provider.host, "主机地址已复制") }] : []),
   ];
   if (provider.kind === "sftp") {
     items.push(
@@ -966,6 +967,7 @@ function isTextEntry(entry) { return ["txt", "md", "log", "conf", "ini", "yaml",
 function isMediaEntry(entry) { return ["mp4", "m4v", "m3u8", "m3u"].includes(fileExtension(entry.name)); }
 
 async function openFile(side, entry) {
+  if (fileExtension(entry.name || entry.path) === "pdf") { FloePDF.open(side, entry); return; }
   if (isImageEntry(entry)) { openImage(side, entry); return; }
   if (isMediaEntry(entry)) { openMedia(side, entry); return; }
   await openEditor(side, entry);
@@ -1401,49 +1403,8 @@ async function openEditor(side, entry, providerID = "") {
     $("#editorContent").focus();
     return;
   }
-  clearTimeout(editorPreviewTimer);
-  closeEditorFind();
-  state.editor = null;
-  const previewKind = isMarkdownPath(entry.path) ? "markdown" : (isHTMLPath(entry.path) ? "html" : "");
-  setDocumentPreview(false, previewKind);
-  $("#editorTitle").textContent = entry.path;
-	$("#editorTitle").title = entry.path;
-	$("#editorDirty").classList.add("hidden");
-  $("#editorContent").value = "";
-  $("#editorHighlight").textContent = "";
-	$("#editorLineNumbers").textContent = "1";
-	$("#editorPosition").textContent = "Ln 1, Col 1";
-	$("#editorFormat").textContent = "UTF-8";
-  $("#editorState").textContent = "正在读取…";
-  $("#saveEditor").disabled = true;
-  try {
-    const result = await api(`/api/v1/files/content?provider=${encodeURIComponent(providerID)}&path=${encodeURIComponent(entry.path)}`);
-    const loadedEditor = {
-	  provider: providerID, path: entry.path, etag: result.etag, side, language: syntaxForPath(entry.path),
-	  originalContent: result.content, dirty: false, saving: false, encoding: result.encoding || "utf-8",
-	  bom: Boolean(result.bom), newline: result.newline || "lf", mixedNewlines: Boolean(result.mixed_newlines),
-	  size: result.size ?? new TextEncoder().encode(result.content).length, lineCount: 0, matchCase: false,
-	  previewKind, previewOpen: false, previewFocus: false, htmlPreviewToken: "", htmlPreviewSequence: 0,
-	  htmlViewportMode: "responsive", htmlViewportWidth: 1280, htmlViewportHeight: 720, htmlViewportScale: 1,
-	};
-    item.editor = loadedEditor;
-    item.text = { content: result.content, selectionStart: 0, selectionEnd: 0, scrollTop: 0, syntax: "auto" };
-    // The user may have switched to another tab while the file was loading.
-    if (state.preview.activeID !== item.id) return;
-    state.editor = loadedEditor;
-    $("#editorTitle").textContent = entry.path;
-	$("#editorTitle").title = entry.path;
-    $("#editorContent").value = result.content;
-	$("#syntaxMode").value = "auto";
-	refreshEditorDisplay();
-    $("#editorContent").focus();
-  } catch (error) {
-    if (state.preview.activeID === item.id) {
-      setDocumentPreview(false, "");
-      $("#editorState").textContent = `读取失败：${error.message}`;
-    }
-    toast(error.message, "error");
-  }
+  applyPreview(item);
+  await loadTextPreview(item, side);
 }
 
 function isMarkdownPath(filePath) {
@@ -1940,6 +1901,7 @@ function requestCloseEditor() {
 }
 
 async function saveEditor() {
+  if (activePreview()?.loading) return;
   if (!state.editor) return;
 	if (!state.editor.dirty || state.editor.saving) return;
 	const button = $("#saveEditor"), active = state.editor, content = $("#editorContent").value;
@@ -1968,13 +1930,14 @@ async function saveEditor() {
 function toggleDialogMaximized(dialog, button) {
   state.preview.maximized = !state.preview.maximized;
   for (const selector of Object.values(PREVIEW_DIALOGS)) $(selector).classList.toggle("maximized", state.preview.maximized);
-  $$("#maximizeEditor, #maximizeImage, #maximizeMedia").forEach((control) => {
+  $$("#maximizeEditor, #maximizeImage, #maximizeMedia, #maximizePDF").forEach((control) => {
     control.innerHTML = '<span class="material-symbols-rounded" aria-hidden="true">fullscreen</span>';
     control.title = state.preview.maximized ? "还原窗口" : "窗口内全屏";
   });
   if (dialog === $("#imageDialog") && state.image) requestAnimationFrame(fitImage);
   if (dialog === $("#mediaDialog")) requestAnimationFrame(fitMediaPlayer);
   if (dialog === $("#editorDialog") && state.editor?.previewKind === "html") requestAnimationFrame(fitHTMLViewport);
+  if (activePreview()?.kind === "pdf") FloePDF.resize();
 }
 
 function openImage(side, entry) {
@@ -1989,11 +1952,20 @@ function openImage(side, entry) {
 function showImageAt(index) {
   if (!state.image || !state.image.entries.length) return;
   const count = state.image.entries.length;
-  state.image.index = (index + count) % count;
+  const nextIndex = (index + count) % count;
+  if (state.image.index !== nextIndex && activePreview()?.loading) {
+    cancelPreviewLoad(activePreview());
+    syncPreviewReloadButtons();
+  }
+  if (state.image.index !== nextIndex && state.image.objectURL) {
+    URL.revokeObjectURL(state.image.objectURL);
+    state.image.objectURL = null;
+  }
+  state.image.index = nextIndex;
   const entry = state.image.entries[state.image.index];
   const image = $("#imagePreview");
   image.removeAttribute("width"); image.removeAttribute("height");
-  image.src = `/api/v1/files/raw?provider=${encodeURIComponent(state.image.provider)}&path=${encodeURIComponent(entry.path)}`;
+  image.src = state.image.objectURL || `/api/v1/files/raw?provider=${encodeURIComponent(state.image.provider)}&path=${encodeURIComponent(entry.path)}&reload=${state.image.revision || 0}`;
   image.alt = entry.name;
   $("#imageTitle").textContent = entry.path;
   $("#imageTitle").title = entry.path;
@@ -2137,8 +2109,8 @@ function closeMedia(closeDialog = true) {
   if (closeDialog && $("#mediaDialog").open) $("#mediaDialog").close();
 }
 
-const PREVIEW_DIALOGS = { text: "#editorDialog", image: "#imageDialog", media: "#mediaDialog" };
-const PREVIEW_KIND_LABELS = { text: "文本", image: "图片", media: "视频" };
+const PREVIEW_DIALOGS = { text: "#editorDialog", image: "#imageDialog", media: "#mediaDialog", pdf: "#pdfDialog" };
+const PREVIEW_KIND_LABELS = { text: "文本", image: "图片", media: "视频", pdf: "PDF" };
 let previewSequence = 0;
 let previewMediaResume = false;
 let mediaLoadSequence = 0;
@@ -2177,6 +2149,7 @@ function openPreview(kind, provider, path) {
   state.preview.activeID = item.id;
   hostPreviewDialog(kind);
   renderPreviewTabs();
+  syncPreviewReloadButtons();
   return item;
 }
 
@@ -2190,6 +2163,7 @@ function activatePreview(id) {
   hostPreviewDialog(item.kind);
   applyPreview(item);
   renderPreviewTabs();
+  syncPreviewReloadButtons();
 }
 
 function hostPreviewDialog(kind) {
@@ -2225,6 +2199,8 @@ function capturePreview(item, preserveMediaPlayback = false) {
     // One <video> element serves every tab, so the outgoing stream is torn down and
     // rebuilt from the saved position when its tab comes back.
     closeMedia(false);
+  } else if (item.kind === "pdf") {
+    FloePDF.capture(item);
   }
 }
 
@@ -2235,6 +2211,8 @@ function applyPreview(item) {
   if (item.kind === "text") applyTextPreview(item);
   else if (item.kind === "image") applyImagePreview(item);
   else if (item.kind === "media") applyMediaPreview(item);
+  else if (item.kind === "pdf") FloePDF.apply(item);
+  syncPreviewReloadButtons();
 }
 
 function applyTextPreview(item) {
@@ -2249,7 +2227,7 @@ function applyTextPreview(item) {
   if (!state.editor) {
     $("#editorHighlight").textContent = "";
     $("#editorLineNumbers").textContent = "1";
-    $("#editorState").textContent = "正在读取…";
+    $("#editorState").textContent = item.loadError || "正在读取…";
     $("#saveEditor").disabled = true;
     setDocumentPreview(false, isMarkdownPath(item.path) ? "markdown" : (isHTMLPath(item.path) ? "html" : ""));
     return;
@@ -2331,6 +2309,7 @@ function setPreviewHost(host) {
 // Reparenting reloads an iframe and can interrupt a video, so the view state that
 // does not survive the move is rebuilt here.
 function restorePreviewViewState(kind) {
+  if (kind === "pdf") FloePDF.resize();
   if (kind === "image" && state.image) requestAnimationFrame(fitImage);
   if (kind === "text" && state.editor?.previewOpen && state.editor.previewKind === "html") {
     renderHTMLPreview();
@@ -2384,6 +2363,9 @@ function closePreviewItem(id) {
     else if (item.kind === "image") state.image = null;
     else if (item.kind === "media") { closeMedia(false); previewMediaResume = false; }
   }
+  cancelPreviewLoad(item);
+  releaseImagePreview(item);
+  if (item.kind === "pdf") FloePDF.release(item);
   releaseHTMLPreview(editor);
   state.preview.items = state.preview.items.filter((entry) => entry.id !== item.id);
   if (!state.preview.items.some((entry) => entry.kind === item.kind)) parkPreviewDialog(item.kind);
@@ -2420,7 +2402,12 @@ function closePreviewWindow(kind) {
   } else if (active?.kind === "media") {
     previewMediaResume = false;
   }
-  for (const item of state.preview.items) releaseHTMLPreview(item.editor);
+  for (const item of state.preview.items) {
+    cancelPreviewLoad(item);
+    releaseImagePreview(item);
+    if (item.kind === "pdf") FloePDF.release(item);
+    releaseHTMLPreview(item.editor);
+  }
   state.preview.items = [];
   state.preview.activeID = "";
   state.preview.host = "dialog";
@@ -2847,6 +2834,7 @@ function toggleMemoryFullscreen(force) {
 }
 
 async function activateMemories() {
+  FloeToolbox.fullscreen(false);
   state.taskFilter = "memories";
   const queue = $("#transferQueue");
   queue.classList.remove("collapsed");
@@ -3296,10 +3284,17 @@ function renderTaskList() {
 	const clearButton = $("#clearTaskHistory");
 	const showingMemories = state.taskFilter === "memories";
 	const showingPreview = state.taskFilter === "preview";
-	list.hidden = showingMemories || showingPreview;
+	const showingToolbox = state.taskFilter === "toolbox";
+	list.hidden = showingMemories || showingPreview || showingToolbox;
 	memoryPanel.hidden = !showingMemories;
 	$("#previewPanel").hidden = !showingPreview;
+	$("#toolboxPanel").hidden = !showingToolbox;
 	updatePreviewVisibility();
+	if (showingToolbox) {
+		clearButton.hidden = true;
+		$("#taskSummary").textContent = "本地计算 · 输入仅在本次窗口保留";
+		return;
+	}
 	if (showingPreview) {
 		clearButton.hidden = true;
 		$("#taskSummary").textContent = "支持多文件预览";
@@ -4125,6 +4120,7 @@ function initializePreviewResize() {
     if (state.preview.host !== "panel") return;
     if (state.image) fitImage();
     if (activePreview()?.kind === "media") fitMediaPlayer();
+    if (activePreview()?.kind === "pdf") FloePDF.resize();
   });
   observer.observe($("#previewHosts"));
   observer.observe($("#imageStage"));
@@ -4262,11 +4258,14 @@ $("#editorDialog").addEventListener("cancel", (event) => {
 });
 $("#syntaxMode").addEventListener("change", refreshEditorHighlight);
 $("#queueToggle").addEventListener("click", () => {
+  if ($("#transferQueue").classList.contains("toolbox-fullscreen")) { FloeToolbox.fullscreen(false); return; }
   if ($("#transferQueue").classList.contains("memory-fullscreen")) toggleMemoryFullscreen(false);
   else $("#transferQueue").classList.toggle("collapsed");
   updatePreviewVisibility();
 });
 $$('.task-tab').forEach((tab) => tab.addEventListener("click", () => {
+  FloeToolbox.fullscreen(false);
+  if (tab.dataset.taskFilter === "toolbox") { FloeToolbox.activate(); return; }
   if (tab.dataset.taskFilter === "memories") {
     activateMemories();
     return;
@@ -4423,6 +4422,11 @@ document.addEventListener("mousedown", (event) => {
   if (!event.target.closest("#memorySearchWrap")) setMemorySearchHistoryOpen(false);
 });
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && $("#transferQueue").classList.contains("toolbox-fullscreen")) {
+    event.preventDefault();
+    FloeToolbox.fullscreen(false);
+    return;
+  }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
     activateMemories();

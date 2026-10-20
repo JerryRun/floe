@@ -6,7 +6,9 @@
   <meta name="color-scheme" content="light">
   <title>Floe</title>
   <link rel="icon" type="image/png" href="/assets/floe-64.png?v=3">
-  <link rel="stylesheet" href="/styles.css?v=19">
+  <link rel="stylesheet" href="/assets/vendor/pdfjs/web/pdf_viewer.css">
+  <link rel="stylesheet" href="/styles.css?v=20">
+  <link rel="stylesheet" href="/workbench-extras.css?v=21">
 </head>
 <body>
   <div class="app-shell">
@@ -77,6 +79,7 @@
             <button class="task-tab" data-task-filter="logs">日志 <span id="logCount">0</span></button>
             <button class="task-tab preview-tab" data-task-filter="preview" hidden>预览 <span id="previewCount">0</span></button>
             <button class="task-tab memory-tab" data-task-filter="memories">速查</button>
+            <button class="task-tab" data-task-filter="toolbox">工具箱</button>
           </div>
           <span id="taskSummary">暂无任务</span>
           <button id="clearTaskHistory" hidden>清空</button>
@@ -113,9 +116,92 @@
               <div class="preview-tabs" id="previewTabs" data-preview-strip></div>
               <button type="button" class="preview-tab-nav" data-preview-nav="next" title="下一个预览标签" aria-label="下一个预览标签"><span class="material-symbols-rounded" aria-hidden="true">chevron_right</span></button>
             </div>
-            <button type="button" id="restorePreviewWindow" title="还原为窗口"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span><span>还原为窗口</span></button>
+            <span class="preview-panel-actions"><button type="button" data-preview-reload title="从文件重新载入" aria-label="重新载入当前文件"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button><button type="button" id="restorePreviewWindow" title="还原为窗口"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span><span>还原为窗口</span></button></span>
           </div>
           <div class="preview-hosts" id="previewHosts"></div>
+        </section>
+        <section class="toolbox-panel" id="toolboxPanel" hidden aria-label="工具箱">
+          <nav class="toolbox-nav" aria-label="选择工具">
+            <button type="button" data-tool="jwt" class="active" aria-pressed="true"><b>JWT</b><span>解析与生成</span></button>
+            <button type="button" data-tool="base64" aria-pressed="false"><b>Base64</b><span>编码与解码</span></button>
+            <button type="button" data-tool="url" aria-pressed="false"><b>URL Encode</b><span>编码与解码</span></button>
+            <button type="button" data-tool="datetime" aria-pressed="false"><b>Date / Time</b><span>日期时间转换</span></button>
+            <button type="button" data-tool="json" aria-pressed="false"><b>JSON</b><span>解析与 jq 过滤</span></button>
+            <button type="button" data-tool="diff" aria-pressed="false"><b>JSON Diff</b><span>结构差异比较</span></button>
+          </nav>
+          <div class="toolbox-workspace">
+            <div class="toolbox-toolbar">
+              <strong id="toolTitle">JWT 解析与生成</strong>
+              <select id="jwtMode" aria-label="JWT 操作"><option value="parse">解析 / 验签</option><option value="generate">生成</option></select>
+              <select id="toolVariant" aria-label="编码格式" hidden></select>
+              <span class="toolbox-toolbar-spacer"></span>
+              <button type="button" id="toolClear">清空</button>
+              <button type="button" id="toolboxFullscreen" title="展开工具箱" aria-label="展开工具箱"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button>
+            </div>
+            <div id="dataTools" class="data-tools" hidden>
+              <section id="datetimeTool" class="data-tool-view" hidden aria-label="日期时间转换">
+                <div class="data-controls date-inputs">
+                  <input id="dateInput" placeholder="留空实时刷新当前时间，或输入日期 / 时间戳" aria-label="日期或时间戳" spellcheck="false">
+                  <select id="dateMode" aria-label="输入日期格式"><option value="auto">自动识别</option><option value="seconds">Unix 时间戳（秒）</option><option value="milliseconds">时间戳（毫秒）</option><option value="date">日期字符串</option><option value="objectid">Mongo ObjectID</option><option value="excel">Excel 日期序列</option></select>
+                  <select id="dateZone" aria-label="日期时区"><option value="local">本地时区</option><option value="utc">UTC</option></select>
+                  <button type="button" id="dateNow">当前时间</button>
+                </div>
+                <p id="dateContext" class="data-hint"></p>
+                <div id="dateResults" class="date-results"></div>
+                <p class="data-hint">无时区的日期按所选时区解释；带偏移的日期和时间戳表示固定时刻。ObjectID 输出仅保留时间前缀，其余补零。</p>
+              </section>
+              <section id="jsonTool" class="data-tool-view json-tool" hidden aria-label="JSON 解析与过滤">
+                <div class="data-controls">
+                  <label><input id="jsonSort" type="checkbox">排序键</label>
+                  <label>缩进<input id="jsonIndent" type="number" min="0" max="8" value="2" aria-label="JSON 缩进空格数"></label>
+                  <label><input id="jsonUnwrap" type="checkbox" checked>解析转义的 JSON 字符串</label>
+                  <button type="button" id="jsonFormat">格式化 / 过滤</button>
+                  <button type="button" id="jsonCompact">压缩</button>
+                </div>
+                <label class="json-query"><span>jq</span><input id="jsonQuery" spellcheck="false" placeholder=".  或  .items[] | select(.active == true) | .name" aria-label="jq 过滤表达式"><button type="button" id="jsonQueryExample">示例</button></label>
+                <div class="data-editors">
+                  <label class="data-editor"><span>原始 JSON</span><textarea id="jsonInput" spellcheck="false" placeholder='{"hello":"world","items":[{"name":"Floe","active":true}]}'></textarea></label>
+                  <div class="data-editor"><div class="data-editor-head"><span>格式化 / 过滤结果</span><button type="button" id="jsonCopy">复制结果</button></div><textarea id="jsonOutput" readonly spellcheck="false" aria-label="JSON 格式化结果"></textarea></div>
+                </div>
+                <p class="data-hint">支持 .field、.[0]、.[]、管道、select、map、keys、length 等 jq 语法。留空表示只格式化；多项输出按 JSON 流逐项显示。大整数保留精度。</p>
+              </section>
+              <section id="diffTool" class="data-tool-view diff-tool" hidden aria-label="JSON 差异比较">
+                <div class="data-controls"><label><input id="diffOnly" type="checkbox" checked>只显示差异</label><button type="button" id="diffCompare">比较</button><button type="button" id="diffSwap">交换左右</button><button type="button" id="diffCopy">复制比较结果</button><span id="diffSummary" class="data-hint"></span></div>
+                <div class="data-editors diff-inputs">
+                  <label class="data-editor"><span>原始 JSON</span><textarea id="diffLeft" spellcheck="false" placeholder='{"a":1,"c":false}'></textarea></label>
+                  <label class="data-editor"><span>比较 JSON</span><textarea id="diffRight" spellcheck="false" placeholder='{"a":2,"b":1}'></textarea></label>
+                </div>
+                <div class="diff-table-wrap"><table class="diff-table"><thead><tr><th>状态 / JSON 路径</th><th>原始值</th><th>比较值</th></tr></thead><tbody id="diffResults"></tbody></table></div>
+                <p class="data-hint">忽略对象键顺序，按数组索引比较；区分 null、缺失、类型变化。绿色为新增，红色为删除，琥珀色为修改。</p>
+              </section>
+              <div id="dataStatus" class="toolbox-status" role="status" aria-live="polite"></div>
+            </div>
+            <div class="toolbox-columns" id="codecColumns">
+              <div class="toolbox-input-column">
+                <label class="toolbox-field" id="toolInputField"><span>输入</span><textarea id="toolInput" spellcheck="false" aria-label="待转换文本" placeholder="输入待转换的文本"></textarea></label>
+                <div id="jwtGenerateFields" class="jwt-generate-fields" hidden>
+                  <label class="toolbox-field"><span>Header · JSON 对象</span><textarea id="jwtHeader" spellcheck="false" aria-label="JWT Header">{"alg":"HS256","typ":"JWT"}</textarea></label>
+                  <label class="toolbox-field"><span>Payload · JSON 对象</span><textarea id="jwtPayload" spellcheck="false" aria-label="JWT Payload" placeholder='{"sub":"user-123"}'></textarea></label>
+                </div>
+                <div class="jwt-secret-row" id="jwtSecretRow">
+                  <label>算法<select id="jwtAlgorithm" aria-label="签名算法"><option>HS256</option><option>HS384</option><option>HS512</option></select></label>
+                  <label class="jwt-secret-label">密钥 · UTF-8<input id="jwtSecret" type="password" autocomplete="off" spellcheck="false" aria-label="JWT 签名密钥" placeholder="生成或验签时填写"></label>
+                </div>
+                <div class="toolbox-actions">
+                  <button type="button" class="primary" id="toolRun">解析</button>
+                  <button type="button" id="toolDecode" hidden>解码</button>
+                  <button type="button" id="jwtVerify">验证签名</button>
+                </div>
+              </div>
+              <div class="toolbox-output-column">
+                <div class="toolbox-result-head"><strong id="toolOutputLabel">解析结果</strong><button type="button" id="toolUseOutput" hidden>结果作为输入</button><button type="button" id="toolCopy">复制结果</button></div>
+                <textarea id="toolOutput" readonly spellcheck="false" aria-label="处理结果" placeholder="处理结果将显示在这里"></textarea>
+                <div id="jwtClaims" class="jwt-claims" hidden></div>
+                <div id="toolStatus" class="toolbox-status" role="status" aria-live="polite"></div>
+              </div>
+            </div>
+            <p class="toolbox-help" id="toolHelp">解析可查看任意 JWT 的内容；选择预期算法并填写密钥后可验证 HMAC 签名。</p>
+          </div>
         </section>
       </section>
     </main>
@@ -176,7 +262,7 @@
         <div class="preview-tabs dialog-preview-tabs" data-preview-strip></div>
         <button type="button" class="preview-tab-nav" data-preview-nav="next" title="下一个预览标签" aria-label="下一个预览标签"><span class="material-symbols-rounded" aria-hidden="true">chevron_right</span></button>
       </div>
-      <span class="preview-window-actions"><button id="collapseEditor" class="collapse-preview" title="收到任务栏标签页" aria-label="收到任务栏标签页"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button><button id="maximizeEditor" class="window-only" title="窗口内全屏" aria-label="窗口内全屏"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button><button id="closeEditor" aria-label="关闭全部预览"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></span>
+      <span class="preview-window-actions"><button type="button" data-preview-reload title="从文件重新载入" aria-label="重新载入当前文件"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button><button id="collapseEditor" class="collapse-preview" title="收到任务栏标签页" aria-label="收到任务栏标签页"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button><button id="maximizeEditor" class="window-only" title="窗口内全屏" aria-label="窗口内全屏"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button><button id="closeEditor" aria-label="关闭全部预览"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></span>
     </div>
 	<div id="editorFindBar" class="editor-find hidden">
 	  <span class="material-symbols-rounded" aria-hidden="true">search</span>
@@ -225,7 +311,7 @@
         <div class="preview-tabs dialog-preview-tabs" data-preview-strip></div>
         <button type="button" class="preview-tab-nav" data-preview-nav="next" title="下一个预览标签" aria-label="下一个预览标签"><span class="material-symbols-rounded" aria-hidden="true">chevron_right</span></button>
       </div>
-      <span class="preview-window-actions"><button id="collapseImage" class="collapse-preview" title="收到任务栏标签页" aria-label="收到任务栏标签页"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button><button id="maximizeImage" class="window-only" title="窗口内全屏" aria-label="窗口内全屏"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button><button id="closeImage" title="关闭全部预览" aria-label="关闭全部预览"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></span>
+      <span class="preview-window-actions"><button type="button" data-preview-reload title="从文件重新载入" aria-label="重新载入当前文件"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button><button id="collapseImage" class="collapse-preview" title="收到任务栏标签页" aria-label="收到任务栏标签页"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button><button id="maximizeImage" class="window-only" title="窗口内全屏" aria-label="窗口内全屏"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button><button id="closeImage" title="关闭全部预览" aria-label="关闭全部预览"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></span>
     </div>
     <div class="image-stage" id="imageStage"><img id="imagePreview" alt=""></div>
     <div class="image-foot preview-bottom-bar"><div class="preview-file-meta"><strong id="imageTitle">图片</strong><span id="imagePosition"></span></div><div class="image-tools preview-footer-actions"><button id="previousImage" title="上一张" aria-label="上一张"><span class="material-symbols-rounded" aria-hidden="true">chevron_left</span></button><button id="zoomOut" title="缩小" aria-label="缩小"><span class="material-symbols-rounded" aria-hidden="true">zoom_out</span></button><span id="zoomLabel">100%</span><button id="zoomIn" title="放大" aria-label="放大"><span class="material-symbols-rounded" aria-hidden="true">zoom_in</span></button><button id="resetZoom" title="恢复大小">1:1</button><button id="nextImage" title="下一张" aria-label="下一张"><span class="material-symbols-rounded" aria-hidden="true">chevron_right</span></button></div></div>
@@ -238,10 +324,41 @@
         <div class="preview-tabs dialog-preview-tabs" data-preview-strip></div>
         <button type="button" class="preview-tab-nav" data-preview-nav="next" title="下一个预览标签" aria-label="下一个预览标签"><span class="material-symbols-rounded" aria-hidden="true">chevron_right</span></button>
       </div>
-      <span class="preview-window-actions"><button id="collapseMedia" class="collapse-preview" title="收到任务栏标签页" aria-label="收到任务栏标签页"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button><button id="maximizeMedia" class="window-only" title="窗口内全屏" aria-label="窗口内全屏"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button><button id="closeMedia" title="关闭全部预览" aria-label="关闭全部预览"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></span>
+      <span class="preview-window-actions"><button type="button" data-preview-reload title="从文件重新载入" aria-label="重新载入当前文件"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button><button id="collapseMedia" class="collapse-preview" title="收到任务栏标签页" aria-label="收到任务栏标签页"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button><button id="maximizeMedia" class="window-only" title="窗口内全屏" aria-label="窗口内全屏"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button><button id="closeMedia" title="关闭全部预览" aria-label="关闭全部预览"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></span>
     </div>
     <div class="media-stage"><video id="mediaPlayer" controls playsinline></video><div id="mediaMessage"></div></div>
     <div class="media-foot preview-bottom-bar"><div class="preview-file-meta"><strong id="mediaTitle">视频</strong><span id="mediaState">准备播放</span></div></div>
+  </dialog>
+
+  <dialog id="pdfDialog" class="dialog pdf-dialog" aria-label="PDF 预览">
+    <div class="preview-window-bar">
+      <div class="preview-tab-strip" data-preview-tab-strip>
+        <button type="button" class="preview-tab-nav" data-preview-nav="previous" title="上一个预览标签" aria-label="上一个预览标签"><span class="material-symbols-rounded" aria-hidden="true">chevron_left</span></button>
+        <div class="preview-tabs dialog-preview-tabs" data-preview-strip></div>
+        <button type="button" class="preview-tab-nav" data-preview-nav="next" title="下一个预览标签" aria-label="下一个预览标签"><span class="material-symbols-rounded" aria-hidden="true">chevron_right</span></button>
+      </div>
+      <span class="preview-window-actions"><button type="button" data-preview-reload title="从文件重新载入" aria-label="重新载入当前文件"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button><button id="collapsePDF" class="collapse-preview" title="收到任务栏标签页" aria-label="收到任务栏标签页"><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button><button id="maximizePDF" class="window-only" title="窗口内全屏" aria-label="窗口内全屏"><span class="material-symbols-rounded" aria-hidden="true">fullscreen</span></button><button id="closePDF" title="关闭全部预览" aria-label="关闭全部预览"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></span>
+    </div>
+    <div class="pdf-stage">
+      <div id="pdfContainer" tabindex="0" aria-label="PDF 页面"><div id="pdfViewer" class="pdfViewer"></div></div>
+      <div id="pdfMessage" class="pdf-message" role="status" hidden></div>
+      <form id="pdfPasswordForm" class="pdf-password" hidden>
+        <label><span id="pdfPasswordLabel">此 PDF 需要密码</span><input id="pdfPassword" type="password" autocomplete="off" aria-label="PDF 密码" required></label>
+        <div><button type="button" id="pdfPasswordCancel">取消</button><button type="submit" class="primary">打开</button></div>
+      </form>
+    </div>
+    <div class="pdf-foot preview-bottom-bar">
+      <div class="preview-file-meta"><strong id="pdfTitle">PDF</strong><span id="pdfState">准备读取</span></div>
+      <div class="pdf-tools preview-footer-actions">
+        <button type="button" id="pdfPrevious" title="上一页" aria-label="上一页"><span class="material-symbols-rounded" aria-hidden="true">chevron_left</span></button>
+        <label class="pdf-page-label"><input id="pdfPage" type="number" min="1" value="1" aria-label="跳转到页码"><span id="pdfPageCount">/ 0</span></label>
+        <button type="button" id="pdfNext" title="下一页" aria-label="下一页"><span class="material-symbols-rounded" aria-hidden="true">chevron_right</span></button>
+        <button type="button" id="pdfZoomOut" title="缩小" aria-label="缩小 PDF"><span class="material-symbols-rounded" aria-hidden="true">zoom_out</span></button>
+        <span id="pdfZoom">100%</span>
+        <button type="button" id="pdfZoomIn" title="放大" aria-label="放大 PDF"><span class="material-symbols-rounded" aria-hidden="true">zoom_in</span></button>
+        <button type="button" id="pdfFitWidth">适应宽度</button>
+      </div>
+    </div>
   </dialog>
 
   <dialog id="transferOptionsDialog" class="dialog transfer-options-dialog">
@@ -299,6 +416,12 @@
   <script src="/assets/hls.min.js" defer></script>
   <script src="/assets/vendor/marked.min.js" defer></script>
   <script src="/assets/vendor/purify.min.js" defer></script>
-  <script src="/app.js?v=19" defer></script>
+  <script src="/codecs.js?v=20" defer></script>
+  <script src="/workbench-data.js?v=21" defer></script>
+  <script src="/preview-reload.js?v=20" defer></script>
+  <script src="/app.js?v=20" defer></script>
+  <script src="/pdf-preview.js?v=20" defer></script>
+  <script src="/data-tools.js?v=23" defer></script>
+  <script src="/toolbox.js?v=21" defer></script>
 </body>
 </html>

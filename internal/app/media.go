@@ -29,7 +29,7 @@ func (s *Server) mediaFile(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadGateway, "PLAYLIST_READ_FAILED", "无法读取 M3U8 播放列表", err.Error())
 			return
 		}
-		content := rewriteHLSPlaylist(string(data), providerID, remotePath)
+		content := rewriteHLSPlaylist(string(data), providerID, remotePath, r.URL.Query().Get("reload"))
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl; charset=utf-8")
 		w.Header().Set("Cache-Control", "private, no-cache")
 		_, _ = io.WriteString(w, content)
@@ -80,7 +80,7 @@ func mediaContentType(extension string) string {
 	}
 }
 
-func rewriteHLSPlaylist(content, providerID, playlistPath string) string {
+func rewriteHLSPlaylist(content, providerID, playlistPath string, revision ...string) string {
 	base := path.Dir(playlistPath)
 	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
 	for index, line := range lines {
@@ -94,16 +94,16 @@ func rewriteHLSPlaylist(content, providerID, playlistPath string) string {
 				if len(matches) != 2 {
 					return attribute
 				}
-				return `URI="` + mediaProxyURI(providerID, base, matches[1]) + `"`
+				return `URI="` + mediaProxyURI(providerID, base, matches[1], revision...) + `"`
 			})
 			continue
 		}
-		lines[index] = mediaProxyURI(providerID, base, trimmed)
+		lines[index] = mediaProxyURI(providerID, base, trimmed, revision...)
 	}
 	return strings.Join(lines, "\n")
 }
 
-func mediaProxyURI(providerID, base, value string) string {
+func mediaProxyURI(providerID, base, value string, revision ...string) string {
 	lower := strings.ToLower(value)
 	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") ||
 		strings.HasPrefix(lower, "data:") || strings.HasPrefix(lower, "blob:") {
@@ -113,5 +113,9 @@ func mediaProxyURI(providerID, base, value string) string {
 	if !strings.HasPrefix(remotePath, "/") {
 		remotePath = path.Join(base, remotePath)
 	}
-	return "/api/v1/files/media?provider=" + url.QueryEscape(providerID) + "&path=" + url.QueryEscape(remotePath)
+	uri := "/api/v1/files/media?provider=" + url.QueryEscape(providerID) + "&path=" + url.QueryEscape(remotePath)
+	if len(revision) > 0 && revision[0] != "" {
+		uri += "&reload=" + url.QueryEscape(revision[0])
+	}
+	return uri
 }

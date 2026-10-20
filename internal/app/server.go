@@ -218,7 +218,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; font-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -284,6 +284,8 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"csrf": "", "name": "Floe"})
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/providers":
 		writeJSON(w, http.StatusOK, s.providers())
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/tools/jq":
+		s.runJQ(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/bookmarks":
 		writeJSON(w, http.StatusOK, s.bookmarks.List())
 	case r.Method == http.MethodPut && r.URL.Path == "/api/v1/bookmarks":
@@ -332,6 +334,8 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		s.rawFile(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/files/media":
 		s.mediaFile(w, r)
+	case (r.Method == http.MethodGet || r.Method == http.MethodHead) && r.URL.Path == "/api/v1/files/pdf":
+		s.pdfFile(w, r)
 	case r.URL.Path == "/api/v1/files/content" && r.Method == http.MethodGet:
 		s.readContent(w, r)
 	case r.URL.Path == "/api/v1/files/content" && r.Method == http.MethodPut:

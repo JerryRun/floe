@@ -37,6 +37,14 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run frontend tests
+        run: node --test internal/app/web/codecs_test.js internal/app/web/workbench_data_test.js internal/app/web/preview_host_test.js
+
       - name: Build Windows executable
         env:
           FLOE_VERSION: ${{ env.RELEASE_TAG }}
@@ -52,6 +60,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          notes_file="docs/releases/$RELEASE_TAG.md"
+          if [ ! -f "$notes_file" ]; then
+            notes_file=".github/release-preamble.md"
+          fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" dist/Floe.exe dist/SHA256SUMS.txt --clobber
           else
@@ -60,6 +72,6 @@ jobs:
               dist/SHA256SUMS.txt \
               --verify-tag \
               --generate-notes \
-              --notes "$(cat .github/release-preamble.md 2>/dev/null || true)" \
+              --notes-file "$notes_file" \
               --title "Floe $RELEASE_TAG"
           fi

@@ -8,7 +8,7 @@ const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
 
-const source = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+const source = ["workbench-data.js", "preview-reload.js", "app.js", "pdf-preview.js", "data-tools.js", "toolbox.js"].map((file) => fs.readFileSync(path.join(__dirname, file), "utf8")).join("\n");
 const nodes = new Map();
 
 function makeNode(key) {

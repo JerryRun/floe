@@ -29,7 +29,7 @@ func TestPreviewUIIsBundledAndSandboxed(t *testing.T) {
 		t.Fatal(err)
 	}
 	page := string(data)
-	for _, marker := range []string{"editorPreviewToggle", "htmlViewportPreset", `sandbox="allow-scripts"`} {
+	for _, marker := range []string{"editorPreviewToggle", "htmlViewportPreset", "pdfDialog", "toolboxPanel", "data-preview-reload", `sandbox="allow-scripts"`} {
 		if !strings.Contains(page, marker) {
 			t.Errorf("bundled preview UI does not contain %q", marker)
 		}
@@ -39,6 +39,21 @@ func TestPreviewUIIsBundledAndSandboxed(t *testing.T) {
 	}
 	if strings.Contains(page, "allow-same-origin") {
 		t.Fatal("HTML preview iframe must not share the Floe origin")
+	}
+}
+
+func TestPDFViewerAssetsBundled(t *testing.T) {
+	for _, file := range []string{
+		"web/assets/vendor/pdfjs/build/pdf.min.mjs",
+		"web/assets/vendor/pdfjs/build/pdf.worker.min.mjs",
+		"web/assets/vendor/pdfjs/web/pdf_viewer.mjs",
+		"web/assets/vendor/pdfjs/web/pdf_viewer.css",
+		"web/assets/vendor/pdfjs/LICENSE",
+	} {
+		data, err := webFiles.ReadFile(file)
+		if err != nil || len(data) == 0 {
+			t.Errorf("PDF.js asset %s is not bundled: %v", file, err)
+		}
 	}
 }
 
