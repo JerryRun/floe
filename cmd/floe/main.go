@@ -5,6 +5,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 
 	"floe/internal/app"
@@ -23,6 +25,7 @@ func main() {
 	listen := flag.String("listen", defaultListenAddress, "loopback address for the Floe web UI")
 	dataDir := flag.String("data-dir", app.DefaultDataDir(), "Floe data directory")
 	noOpen := flag.Bool("no-open", false, "do not open the browser automatically")
+	openGUI := flag.Bool("gui", runtime.GOOS == "windows", "open the native desktop window at startup (Windows)")
 	flag.Parse()
 	initLogging(*dataDir)
 	preferences, preferencesErr := app.LoadPreferences(*dataDir)
@@ -56,7 +59,7 @@ func main() {
 		return
 	}
 	log.Printf("Floe is ready at %s", url)
-	runPlatform(server, url, done, *noOpen, preferences)
+	runPlatform(server, url, *dataDir, done, *noOpen, *openGUI, preferences)
 }
 
 func initLogging(dataDir string) {
@@ -67,6 +70,9 @@ func initLogging(dataDir string) {
 	if err == nil {
 		log.SetOutput(file)
 		log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+		if err := debug.SetCrashOutput(file, debug.CrashOptions{}); err != nil {
+			log.Printf("enable crash logging: %v", err)
+		}
 	}
 }
 

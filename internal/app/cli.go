@@ -19,7 +19,7 @@ import (
 
 const cliReadLimit = int64(256 << 20)
 
-var Version = "0.1.0"
+var Version = "dev"
 
 // RunCLI runs floectl against Floe's saved local configuration. Network
 // commands establish their own short-lived connection and do not require the

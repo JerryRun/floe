@@ -65,11 +65,13 @@ jobs:
             notes_file=".github/release-preamble.md"
           fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/Floe.exe dist/SHA256SUMS.txt --clobber
+            gh release upload "$RELEASE_TAG" dist/Floe.exe dist/SHA256SUMS.txt LICENSE THIRD_PARTY_NOTICES.md --clobber
           else
             gh release create "$RELEASE_TAG" \
               dist/Floe.exe \
               dist/SHA256SUMS.txt \
+              LICENSE \
+              THIRD_PARTY_NOTICES.md \
               --verify-tag \
               --generate-notes \
               --notes-file "$notes_file" \

@@ -3805,7 +3805,9 @@ function bookmarkProviderKey(provider) {
 function providerBookmarks(key) {
   const entries = state.bookmarks[key];
   if (!Array.isArray(entries)) return [];
-  return entries.filter((entry) => entry && typeof entry.path === "string" && typeof entry.label === "string").map((entry) => ({ ...entry }));
+  return entries.filter((entry) => entry && typeof entry.path === "string" && typeof entry.label === "string")
+    .map((entry) => ({ ...entry }))
+    .sort((a, b) => a.label.localeCompare(b.label, "zh-CN", { numeric: true }));
 }
 
 async function saveProviderBookmarks(key, entries) {
@@ -3905,16 +3907,13 @@ async function toggleBookmark(side) {
   const entries = providerBookmarks(key);
   const index = entries.findIndex((entry) => bookmarkPathsEqual(key, entry.path, candidate.path));
   try {
-    if (index >= 0) {
-      entries.splice(index, 1);
-      await saveProviderBookmarks(key, entries);
-      toast("已删除当前路径书签");
-    } else {
-      entries.push({ path: candidate.path, label: candidate.label });
-      entries.sort((a, b) => a.label.localeCompare(b.label, "zh-CN", { numeric: true }));
-      await saveProviderBookmarks(key, entries);
-      toast("已添加当前路径书签");
-    }
+    const updated = await api("/api/v1/bookmarks", {
+      method: "PATCH",
+      body: JSON.stringify({ key, entry: { path: candidate.path, label: candidate.label }, remove: index >= 0 }),
+    });
+    if (updated.length) state.bookmarks[key] = updated;
+    else delete state.bookmarks[key];
+    toast(index >= 0 ? "已删除当前路径书签" : "已添加当前路径书签");
   } catch (error) {
     toast(error.message, "error");
   }
@@ -3953,15 +3952,28 @@ function showBookmarkMenu(side, anchor) {
   menu.style.top = `${Math.min(rect.bottom + 2, window.innerHeight - menu.offsetHeight - 6)}px`;
 }
 
-function toggleBookmarkMenu(side, anchor) {
+let bookmarkMenuRequest = 0;
+
+async function toggleBookmarkMenu(side, anchor) {
   if ($("#bookmarkMenu").classList.contains("open") && state.bookmarkSide === side) {
     hideBookmarkMenu();
     return;
   }
+  const request = ++bookmarkMenuRequest;
   showBookmarkMenu(side, anchor);
+  try {
+    const stored = await api("/api/v1/bookmarks");
+    if (request !== bookmarkMenuRequest) return;
+    state.bookmarks = stored;
+    for (const item of ["left", "right"]) updateBookmarkControl(item);
+    showBookmarkMenu(side, anchor);
+  } catch (error) {
+    if (request === bookmarkMenuRequest) toast(error.message, "error");
+  }
 }
 
 function hideBookmarkMenu() {
+  bookmarkMenuRequest++;
   $("#bookmarkMenu").classList.remove("open");
   $$(".bookmark-menu-button").forEach((button) => button.setAttribute("aria-expanded", "false"));
 }

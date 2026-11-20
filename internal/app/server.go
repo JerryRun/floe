@@ -290,6 +290,8 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.bookmarks.List())
 	case r.Method == http.MethodPut && r.URL.Path == "/api/v1/bookmarks":
 		s.saveBookmarks(w, r)
+	case r.Method == http.MethodPatch && r.URL.Path == "/api/v1/bookmarks":
+		s.updateBookmark(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/memory-settings":
 		s.memorySettings(w)
 	case r.Method == http.MethodPut && r.URL.Path == "/api/v1/memory-settings":
@@ -332,7 +334,7 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		s.thumbnail(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/files/raw":
 		s.rawFile(w, r)
-	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/files/media":
+	case (r.Method == http.MethodGet || r.Method == http.MethodHead) && r.URL.Path == "/api/v1/files/media":
 		s.mediaFile(w, r)
 	case (r.Method == http.MethodGet || r.Method == http.MethodHead) && r.URL.Path == "/api/v1/files/pdf":
 		s.pdfFile(w, r)
@@ -400,7 +402,7 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 func (s *Server) saveBookmarks(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		Key     string         `json:"key"`
-		Entries []pathBookmark `json:"entries"`
+		Entries []PathBookmark `json:"entries"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
@@ -410,6 +412,26 @@ func (s *Server) saveBookmarks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) updateBookmark(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Key    string       `json:"key"`
+		Entry  PathBookmark `json:"entry"`
+		Remove bool         `json:"remove"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	entries, err := s.bookmarks.Update(request.Key, request.Entry, request.Remove)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "BOOKMARK_SAVE_FAILED", "保存书签失败", err.Error())
+		return
+	}
+	if entries == nil {
+		entries = []PathBookmark{}
+	}
+	writeJSON(w, http.StatusOK, entries)
 }
 
 func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
@@ -1193,7 +1215,7 @@ func (s *Server) createLocalTab(w http.ResponseWriter, r *http.Request) {
 	if name == "" || name == "." || name == string(filepath.Separator) {
 		name = root
 	}
-	id := fmt.Sprintf("local-%d", time.Now().UnixNano())
+	id := "local-" + randomToken(12)
 	provider, err := core.NewLocalFSWithKind(id, name, root, "local", "本地")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "LOCAL_TAB_FAILED", "无法创建本地标签", err.Error())

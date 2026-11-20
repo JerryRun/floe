@@ -10,11 +10,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"runtime"
 	"time"
 	"unsafe"
 
 	"floe/internal/app"
+
+	"github.com/egoist/mygo"
 	"golang.org/x/sys/windows"
 )
 
@@ -22,7 +23,6 @@ import (
 var trayIcon []byte
 
 const (
-	wmDestroy       = 0x0002
 	wmClose         = 0x0010
 	wmLButtonDblClk = 0x0203
 	wmRButtonUp     = 0x0205
@@ -48,30 +48,25 @@ const (
 	mfChecked   = 0x00000008
 	mfSeparator = 0x00000800
 
-	tpmRightButton  = 0x0002
-	tpmReturnCmd    = 0x0100
-	tdfUseHIconMain = 0x0002
-	tdcbfOKButton   = 0x0001
+	tpmRightButton = 0x0002
+	tpmReturnCmd   = 0x0100
 
 	menuOpen        = 1001
 	menuPowerShell  = 1002
 	menuAbout       = 1003
 	menuQuit        = 1004
 	menuOpenAtStart = 1005
+	menuDesktop     = 1006
 )
 
 var (
 	user32                  = windows.NewLazySystemDLL("user32.dll")
 	shell32                 = windows.NewLazySystemDLL("shell32.dll")
-	comctl32                = windows.NewLazySystemDLL("comctl32.dll")
 	kernel32                = windows.NewLazySystemDLL("kernel32.dll")
 	procRegisterClassEx     = user32.NewProc("RegisterClassExW")
 	procCreateWindowEx      = user32.NewProc("CreateWindowExW")
 	procDefWindowProc       = user32.NewProc("DefWindowProcW")
-	procGetMessage          = user32.NewProc("GetMessageW")
-	procTranslateMessage    = user32.NewProc("TranslateMessage")
-	procDispatchMessage     = user32.NewProc("DispatchMessageW")
-	procPostQuitMessage     = user32.NewProc("PostQuitMessage")
+	procDestroyWindow       = user32.NewProc("DestroyWindow")
 	procPostMessage         = user32.NewProc("PostMessageW")
 	procLoadImage           = user32.NewProc("LoadImageW")
 	procDestroyIcon         = user32.NewProc("DestroyIcon")
@@ -79,10 +74,10 @@ var (
 	procAppendMenu          = user32.NewProc("AppendMenuW")
 	procDestroyMenu         = user32.NewProc("DestroyMenu")
 	procTrackPopupMenu      = user32.NewProc("TrackPopupMenu")
+	procGetDoubleClickTime  = user32.NewProc("GetDoubleClickTime")
 	procGetCursorPos        = user32.NewProc("GetCursorPos")
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 	procShellNotifyIcon     = shell32.NewProc("Shell_NotifyIconW")
-	procTaskDialogIndirect  = comctl32.NewProc("TaskDialogIndirect")
 	procGetModuleHandle     = kernel32.NewProc("GetModuleHandleW")
 	activeTray              *nativeTray
 )
@@ -90,16 +85,6 @@ var (
 type point struct {
 	X int32
 	Y int32
-}
-
-type message struct {
-	Window  uintptr
-	Message uint32
-	WParam  uintptr
-	LParam  uintptr
-	Time    uint32
-	Point   point
-	Private uint32
 }
 
 type windowClassEx struct {
@@ -135,38 +120,13 @@ type notifyIconData struct {
 	BalloonIcon uintptr
 }
 
-type taskDialogConfig struct {
-	Size                 uint32
-	Parent               uintptr
-	Instance             uintptr
-	Flags                uint32
-	CommonButtons        uint32
-	WindowTitle          *uint16
-	MainIcon             uintptr
-	MainInstruction      *uint16
-	Content              *uint16
-	ButtonCount          uint32
-	Buttons              uintptr
-	DefaultButton        int32
-	RadioButtonCount     uint32
-	RadioButtons         uintptr
-	DefaultRadioButton   int32
-	VerificationText     *uint16
-	ExpandedInformation  *uint16
-	ExpandedControlText  *uint16
-	CollapsedControlText *uint16
-	FooterIcon           uintptr
-	Footer               *uint16
-	Callback             uintptr
-	CallbackData         uintptr
-	Width                uint32
-}
-
 type nativeTray struct {
 	window      uintptr
 	icon        uintptr
 	server      *app.Server
 	preferences *app.Preferences
+	desktop     *desktopWindow
+	about       *mygo.Window
 	nid         notifyIconData
 }
 
@@ -202,49 +162,47 @@ func messageBox(value string, style uint32) {
 	_, _ = windows.MessageBox(0, text, title, style)
 }
 
-func runPlatform(server *app.Server, initialURL string, done <-chan error, noOpen bool, preferences *app.Preferences) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	tray, err := newNativeTray(server, preferences)
-	if err != nil {
-		fail("Floe 托盘初始化失败", err)
-		return
-	}
-	defer tray.close()
-	activeTray = tray
-
-	if !noOpen && preferences.OpenBrowserOnStartup() {
+func runPlatform(server *app.Server, initialURL, dataDir string, done <-chan error, noOpen, openGUI bool, preferences *app.Preferences) {
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+	}()
+	mygo.App.SetName("Floe")
+	mygo.App.OnWindowAllClosed(func() {})
+	loopDone := make(chan struct{})
+	defer close(loopDone)
+	var tray *nativeTray
+	mygo.App.WhenReady(func() {
+		var err error
+		tray, err = newNativeTray(server, preferences)
+		if err != nil {
+			fail("Floe 托盘初始化失败", err)
+			mygo.App.Quit()
+			return
+		}
+		tray.desktop = newDesktopWindow(initialURL, dataDir)
+		if openGUI {
+			tray.desktop.open()
+		}
+		if !noOpen && preferences.OpenBrowserOnStartup() {
+			go tray.openUI()
+		}
+		window := tray.window
 		go func() {
-			if err := app.OpenBrowser(initialURL); err != nil {
-				log.Printf("open browser: %v", err)
+			select {
+			case err := <-done:
+				app.LogServeError(err)
+				_, _, _ = procPostMessage.Call(window, wmClose, 0, 0)
+			case <-loopDone:
 			}
 		}()
+	})
+	mygo.App.OnWillQuit(func(*mygo.QuitEvent) { tray.close() })
+	if err := mygo.App.Run(); err != nil {
+		tray.close()
+		fail("Floe 桌面事件循环启动失败", err)
 	}
-	go func() {
-		if err := <-done; err != nil {
-			app.LogServeError(err)
-		}
-		_, _, _ = procPostMessage.Call(tray.window, wmClose, 0, 0)
-	}()
-
-	var msg message
-	for {
-		result, _, callErr := procGetMessage.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
-		if int32(result) == -1 {
-			log.Printf("Windows message loop: %v", callErr)
-			break
-		}
-		if result == 0 {
-			break
-		}
-		_, _, _ = procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
-		_, _, _ = procDispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = server.Shutdown(ctx)
 }
 
 func newNativeTray(server *app.Server, preferences *app.Preferences) (*nativeTray, error) {
@@ -323,23 +281,25 @@ func (t *nativeTray) close() {
 		_, _, _ = procDestroyIcon.Call(t.icon)
 		t.icon = 0
 	}
+	if t.window != 0 {
+		_, _, _ = procDestroyWindow.Call(t.window)
+		t.window = 0
+	}
+	activeTray = nil
 }
 
 func trayWindowProc(window uintptr, message uint32, wParam, lParam uintptr) uintptr {
 	switch message {
 	case wmAppTray:
 		event := uint32(lParam & 0xffff)
-		if event == wmLButtonDblClk && activeTray != nil {
-			go activeTray.openUI()
+		if event == wmLButtonDblClk && activeTray != nil && activeTray.desktop != nil {
+			activeTray.desktop.open()
 		} else if event == wmRButtonUp && activeTray != nil {
 			activeTray.showMenu()
 		}
 		return 0
-	case wmDestroy:
-		if activeTray != nil {
-			activeTray.close()
-		}
-		procPostQuitMessage.Call(0)
+	case wmClose:
+		mygo.App.Quit()
 		return 0
 	}
 	result, _, _ := procDefWindowProc.Call(window, uintptr(message), wParam, lParam)
@@ -354,7 +314,8 @@ func (t *nativeTray) showMenu() {
 	defer procDestroyMenu.Call(menu)
 	appendMenu(menu, mfString|mfGray, 0, "Floe Core 已连接")
 	appendMenu(menu, mfSeparator, 0, "")
-	appendMenu(menu, mfString, menuOpen, "打开 Floe")
+	appendMenu(menu, mfString, menuOpen, "在浏览器中打开")
+	appendMenu(menu, mfString, menuDesktop, "打开桌面窗口")
 	appendMenu(menu, mfString, menuPowerShell, "打开 PowerShell")
 	startupFlags := uint32(mfString)
 	if t.preferences.OpenBrowserOnStartup() {
@@ -373,6 +334,8 @@ func (t *nativeTray) showMenu() {
 	switch command {
 	case menuOpen:
 		go t.openUI()
+	case menuDesktop:
+		t.desktop.open()
 	case menuPowerShell:
 		go func() {
 			if err := app.LaunchPowerShell(""); err != nil {
@@ -390,22 +353,6 @@ func (t *nativeTray) showMenu() {
 		t.showAbout()
 	case menuQuit:
 		_, _, _ = procPostMessage.Call(t.window, wmClose, 0, 0)
-	}
-}
-
-func (t *nativeTray) showAbout() {
-	title, _ := windows.UTF16PtrFromString("关于 Floe")
-	name, _ := windows.UTF16PtrFromString("Floe")
-	details, _ := windows.UTF16PtrFromString("远程文件工作区\n\n作者：Jerry\n版本：" + app.Version)
-	config := taskDialogConfig{
-		Size: uint32(unsafe.Sizeof(taskDialogConfig{})), Parent: t.window,
-		Flags: tdfUseHIconMain, CommonButtons: tdcbfOKButton,
-		WindowTitle: title, MainIcon: t.icon, MainInstruction: name, Content: details,
-	}
-	result, _, callErr := procTaskDialogIndirect.Call(uintptr(unsafe.Pointer(&config)), 0, 0, 0)
-	if int32(result) < 0 {
-		log.Printf("show Floe about dialog: %v (HRESULT 0x%x)", callErr, result)
-		messageBox("Floe\n\n远程文件工作区\n作者：Jerry\n版本："+app.Version, windows.MB_OK|windows.MB_ICONINFORMATION)
 	}
 }
 
